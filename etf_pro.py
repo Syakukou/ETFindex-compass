@@ -559,8 +559,8 @@ class ProWindow(QMainWindow):
         left.addLayout(row)
 
         self.risk_scope = QComboBox()
-        self.risk_scope.addItems(["成交额前40", "全部", "当前分类"])
-        self.risk_scope.setToolTip("全部 160+ 只时会很挤, 默认只看成交额前 40")
+        self.risk_scope.addItems(["全部", "成交额前40", "当前分类"])
+        self.risk_scope.setToolTip("默认全部(155 只左右, 圆点大小=成交额); 嫌挤可只看成交额前 40")
         self.risk_scope.currentIndexChanged.connect(lambda _: self.draw_risk())
         left.addWidget(self.risk_scope)
 
@@ -602,6 +602,7 @@ class ProWindow(QMainWindow):
         self._risk_ranked = []
         self._risk_ax = None
         self._risk_sel = None
+        self._risk_no_scroll = False
         lw = QWidget()
         lw.setLayout(left)
         lw.setFixedWidth(438)      # 6 列要放得下, 太窄右侧列会被裁掉
@@ -671,9 +672,15 @@ class ProWindow(QMainWindow):
                p["amp"] or 0, n0(p["ratio"], 2)))
 
     def _on_risk_pick(self, idx):
+        """右边表点行 -> 左边散点高亮 + 十字线。行是用户自己点的, 不要把它滚走。"""
         if 0 <= idx.row() < len(self._risk_pts):
-            self._risk_sel = self._risk_pts[idx.row()]["code"]
+            p = self._risk_pts[idx.row()]
+            self._risk_sel = p["code"]
+            self._risk_no_scroll = True
             self.draw_risk()
+            self.status.setText("%s (%s) · %s %+.2f%% · 波动 %.2f%% · 收益/波动 %s · 已在散点图定位"
+                                % (p["name"], p["code"], self.risk_win.currentText(),
+                                   p["ret"], p["amp"] or 0, n0(p["ratio"], 2)))
 
     def _on_risk_dbl(self, idx):
         if 0 <= idx.row() < len(self._risk_pts):
@@ -1230,21 +1237,48 @@ class ProWindow(QMainWindow):
                 "%s %s · 本地库里没有别的 ETF 持有它(可能只在这只的持仓里，或那些 ETF 还没补全)"
                 % (stock, r["name"]))
             return
+        codes = {c for c, _ in hits}
+        # 当前筛选只露出其中几只(或一只都不露)时, 橙底标了也看不出"被这么多家持有",
+        # 直接放开筛选再标 —— 用户点这只票就是要看全套持有人
+        vis = {self.hold_list.item(i).data(Qt.UserRole)
+               for i in range(self.hold_list.count())}
+        n_vis = len(codes & vis)
+        dropped = bool(self.hold_search.text().strip()) or \
+            self.hold_cat.currentText() not in ("全部", "")
+        if dropped and n_vis < len(codes):
+            self.hold_cat.blockSignals(True)
+            self.hold_search.blockSignals(True)
+            self.hold_cat.setCurrentText("全部")
+            self.hold_search.clear()
+            self.hold_cat.blockSignals(False)
+            self.hold_search.blockSignals(False)
+            self._fill_hold_list()      # 保住当前正在看的那只, 不被重建带走
+            self._auto_clear = n_vis
         self._hold_mark = stock
-        self._mark_holders({c for c, _ in hits},
-                           "%s %s" % (stock, r["name"]), len(hits))
+        self._mark_holders(codes, "%s %s" % (stock, r["name"]), len(hits))
+        if getattr(self, "_auto_clear", None) is not None:
+            self.hold_meta.setText(self.hold_meta.text() +
+                                   " · 原筛选只露出 %d 只, 已自动切回全部" % self._auto_clear)
+            self._auto_clear = None
 
     def _mark_holders(self, codes, label, n_all=0):
         n_vis = 0
+        first = -1
         for i in range(self.hold_list.count()):
             it = self.hold_list.item(i)
             hot = it.data(Qt.UserRole) in codes
             it.setBackground(QColor("#5a4320") if hot else QColor(0, 0, 0, 0))
             if hot:
                 n_vis += 1
+                if first < 0:
+                    first = i
         if not codes:
             self.hold_meta.setText(getattr(self, "_hold_meta_txt", "标的 · 点选查看重仓股"))
             return
+        # 橙底那一堆可能在列表很下面, 不滚过去等于没标
+        if first >= 0:
+            self.hold_list.scrollToItem(self.hold_list.item(first),
+                                        QAbstractItemView.PositionAtCenter)
         self.hold_meta.setText(
             "%s 被 %d 只 ETF 持有 · 橙底标出(当前筛选里可见 %d 只) · 双击行跳到仓位最重的"
             % (label, n_all, n_vis))
@@ -2609,6 +2643,7 @@ class ProWindow(QMainWindow):
                                ctx["m"][i, j]))
 
     def _on_corr_pair_pick(self, idx):
+        """左边配对表点一行 -> 右上矩阵框出这两行两列 + 下方出对比走势。"""
         ctx = self._corr_ctx
         if not ctx or not (0 <= idx.row() < len(self._corr_show)):
             return
@@ -2618,6 +2653,15 @@ class ProWindow(QMainWindow):
             i, j = codes.index(ca), codes.index(cb_)
             self._corr_pair = (i, j) if i < j else (j, i)
             self.draw_corr()
+            # 重算会重建配对表并滚回顶部, 不把这一对重新选回来, 看着就像点了没反应
+            self._corr_focus_row()
+            self.corr_pair_lbl.setText(
+                "已选 %s vs %s · 相关 %.2f · 矩阵里已框出这两行两列, 下方是对比走势"
+                % (short_name(ctx["names"][i], 9), short_name(ctx["names"][j], 9),
+                   ctx["m"][self._corr_pair[0], self._corr_pair[1]]))
+            self.status.setText("%s vs %s · 近 %s 日相关 %.2f"
+                                % (ctx["names"][i], ctx["names"][j], ctx["days"],
+                                   ctx["m"][i, j]))
 
     def _corr_filter_later(self):
         """搜索框每敲一个字就重建一万行会卡, 停顿一下再建。"""
@@ -2786,6 +2830,10 @@ class ProWindow(QMainWindow):
         # 选中: 两格描边 + 贯穿的十字线(155 只时那两格只有几个像素, 不画线根本找不到)
         if pair:
             i, j = pair
+            # 155×155 时一个格子只有几个像素, 描边根本看不见, 先铺两条色带把行列拉出来
+            for idx in (i, j):
+                ax.axhspan(idx - 0.5, idx + 0.5, color=ACCENT, alpha=0.22, zorder=5)
+                ax.axvspan(idx - 0.5, idx + 0.5, color=ACCENT, alpha=0.22, zorder=5)
             for (a_, b_) in ((i, j), (j, i)):
                 ax.add_patch(Rectangle((b_ - 0.5, a_ - 0.5), 1, 1, fill=False,
                                        edgecolor=ACCENT, lw=2.0, zorder=6))
@@ -3005,8 +3053,13 @@ class ProWindow(QMainWindow):
         if sel:
             hit = next((i for i, p in enumerate(pts) if p["code"] == sel), None)
             if hit is not None:
-                ax.scatter([xv[hit]], [yv[hit]], s=[sizes[hit] + 130], facecolors="none",
-                           edgecolors=ACCENT, linewidths=1.6, zorder=5)
+                # 十字线: 155 个点里一个描边圈根本找不到, 拉起两条线才看得见"它在哪一档"
+                ax.axvline(xv[hit], color=ACCENT, ls="--", lw=0.9, alpha=0.55, zorder=4)
+                ax.axhline(yv[hit], color=ACCENT, ls="--", lw=0.9, alpha=0.55, zorder=4)
+                ax.scatter([xv[hit]], [yv[hit]], s=[sizes[hit] + 260], facecolors="none",
+                           edgecolors=ACCENT, linewidths=1.9, alpha=0.55, zorder=5)
+                ax.scatter([xv[hit]], [yv[hit]], s=[sizes[hit] + 100], facecolors="none",
+                           edgecolors="#ffffff", linewidths=1.5, zorder=5)
                 r = pts[hit]
                 ax.annotate("%s \n%s %+.2f%%  波动%.2f%%  比值%s"
                             % (r["name"][:14], wlab, r["ret"], r["amp"], n0(r["ratio"], 2)),
@@ -3076,13 +3129,16 @@ class ProWindow(QMainWindow):
             v = r["ratio"] or 0
             it.setForeground(QColor(UP if v >= 1 else WARN if v >= 0 else DOWN))
             t.setItem(i, 5, it)
+        no_scroll = bool(getattr(self, "_risk_no_scroll", False))
+        self._risk_no_scroll = False
         if self._risk_sel:
             for i, r in enumerate(rows):
                 if r["code"] == self._risk_sel:
                     t.selectRow(i)
                     it = t.item(i, 0)
-                    # 点图上圆点时选中行常常在视野外, 不滚过去看着就像没反应
-                    if it is not None:
+                    # 点图上圆点时选中行常常在视野外, 不滚过去看着就像没反应;
+                    # 但如果是用户自己点表里的行, 再滚一次等于把他点的位置丢掉
+                    if it is not None and not no_scroll:
                         t.scrollToItem(it, QAbstractItemView.PositionAtCenter)
                     break
         else:
