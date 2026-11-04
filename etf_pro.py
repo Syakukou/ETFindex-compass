@@ -169,6 +169,17 @@ class FlowThread(QThread):
             d = etf_flow.snapshot(self.scores, self.db)
         except Exception as e:
             d = {"rows": [], "err": ["%s: %s" % (type(e).__name__, e)]}
+        # 打包成窗口程序后 stderr 看不见, 取数失败只会表现为"整页空白";
+        # 这里落一行日志到 exe 同级, 出问题能直接翻原因
+        try:
+            import time as _t
+            with open(str(Path(etf_app.DB).parent / "flow_debug.log"), "a",
+                      encoding="utf-8") as f:
+                f.write("[%s] rows=%d fut=%d opt=%d err=%s\n" % (
+                    _t.strftime("%Y-%m-%d %H:%M:%S"), len(d.get("rows") or []),
+                    len(d.get("fut") or {}), len(d.get("opt") or {}), d.get("err")))
+        except Exception:
+            pass
         self.done.emit(d)
 
 
@@ -1831,10 +1842,20 @@ class ProWindow(QMainWindow):
     # ---- 结论条
     def _flow_ready(self, d):
         self._flow_busy = False
+        if getattr(self, "_flow_wd", None):
+            self._flow_wd.stop()
         self.btn_flow.setEnabled(True)
         self.btn_flow.setText(" 刷新数据 ")
         if not d or not d.get("rows"):
-            self.flow_meta.setText("取数失败: " + " / ".join((d or {}).get("err") or ["未知"]))
+            err = " / ".join((d or {}).get("err") or ["未知"])
+            self.flow_meta.setText("取数失败: " + err)
+            self.btn_flow.setText(" 重试 ")
+            self.flow_concl.setText(
+                "<span style='color:%s'>这一页要联网取指数/期货/期权行情, 这次没取到。</span>"
+                "　原因: %s　·　点右上「重试」再来一次; 反复失败就看 exe 同级目录的 "
+                "flow_debug.log" % (WARN, err))
+            self.flow_note.setText("")
+            self._draw_flow_placeholder("取数失败")
             return
         self.flow_data = d
         self.idx_groups = d["rows"]
@@ -1870,11 +1891,47 @@ class ProWindow(QMainWindow):
         self.btn_flow.setEnabled(False)
         self.btn_flow.setText(" 取数中… ")
         self.flow_meta.setText("正在取指数/期货/期权…")
-        th = FlowThread(list(self.analyzer.scores), str(BASE / "etf_tracker.db"))
+        self._draw_flow_placeholder("正在取数…", "指数/期货/期权行情要联网, 通常 5 到 20 秒")
+        self._arm_flow_watchdog()
+        th = FlowThread(list(self.analyzer.scores), str(etf_app.DB))
         th.done.connect(self._flow_ready)
         th.done.connect(th.deleteLater)
         self._flow_thread = th
         th.start()
+
+    def _arm_flow_watchdog(self):
+        """取数卡死时页面会一直是空的, 到点必须给个说法而不是继续假装在加载。"""
+        t = getattr(self, "_flow_wd", None)
+        if t is None:
+            t = self._flow_wd = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._flow_timeout)
+        t.start(90000)
+
+    def _flow_timeout(self):
+        if not getattr(self, "_flow_busy", False):
+            return
+        self._flow_busy = False
+        self.btn_flow.setEnabled(True)
+        self.btn_flow.setText(" 重试 ")
+        self.flow_meta.setText("取数超过 90 秒没有返回")
+        self.flow_concl.setText(
+            "<span style='color:%s'>这一页要联网取指数/期货/期权行情, 90 秒没回来。</span>"
+            "　点右上「重试」再来一次; 一直不动就看 exe 同级目录的 flow_debug.log" % WARN)
+        self._draw_flow_placeholder("取数超时", "网络卡住或被拦截, 点「重试」")
+
+    def _draw_flow_placeholder(self, title, sub=""):
+        """没数据时别留一片纯黑, 至少写清楚在等什么。"""
+        fig = self.flow_chart.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.set_axis_off()
+        ax.text(0.5, 0.56, title, ha="center", va="center", color=TXT, fontsize=13,
+                transform=ax.transAxes)
+        if sub:
+            ax.text(0.5, 0.44, sub, ha="center", va="center", color=SUB, fontsize=9.5,
+                    transform=ax.transAxes)
+        self.flow_chart.draw()
 
     # ---- 图形
     def _etf_kl(self, code):
@@ -1886,7 +1943,7 @@ class ProWindow(QMainWindow):
         kl = []
         try:
             import etf_flow
-            kl = etf_flow.etf_klines(str(BASE / "etf_tracker.db"), [code], 60).get(code) or []
+            kl = etf_flow.etf_klines(str(etf_app.DB), [code], 60).get(code) or []
         except Exception:
             kl = []
         cache[code] = kl

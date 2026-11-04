@@ -132,7 +132,7 @@ def fetch_futures():
         try:
             df = ak.futures_main_sina(symbol=sym + "0")
         except Exception as e:
-            out[sym] = {"err": type(e).__name__}
+            out[sym] = {"err": "%s: %s" % (type(e).__name__, e)}
             continue
         if df is None or df.empty:
             out[sym] = {"err": "空数据"}
@@ -590,7 +590,7 @@ def snapshot(rows, db_path, log=None):
         fut = fetch_futures()
     except Exception as e:
         fut = {}
-        err.append("期货 " + type(e).__name__)
+        err.append("期货 %s: %s" % (type(e).__name__, e))
     fmap = {"IH": "000016", "IF": "000300", "IC": "000905", "IM": "000852"}
     # 逐个补基差
     for sym, code in fmap.items():
