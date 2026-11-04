@@ -1001,6 +1001,9 @@ class ProWindow(QMainWindow):
         left.addWidget(self.hold_search)
         self.hold_list = QListWidget()
         self.hold_list.currentItemChanged.connect(self._on_hold_pick)
+        # 再点当前已选中的那行不会触发 currentItemChanged, 所以额外接点击:
+        # 点左边任何一只都算"放弃看右边那只股票", 橙底必须当场清掉
+        self.hold_list.itemClicked.connect(self._on_hold_click)
         left.addWidget(self.hold_list, 1)
         hb = QHBoxLayout()
         b1 = QPushButton(" 重取该只 ")
@@ -1152,6 +1155,7 @@ class ProWindow(QMainWindow):
                 tip = ("%s\n这只不披露股票持仓(货币/黄金/商品/跨境类), 季报里只有基金资产构成, 不是抓漏"
                        % e["category"])
             it.setToolTip(tip)
+            it.setData(Qt.UserRole + 1, tip)     # 原始 tooltip, 标橙底时在其后追加持有明细
             self.hold_list.addItem(it)
         pool = len(a.etfs)
         n_listed = sum(1 for e in a.etfs if e.get("listed") is False)
@@ -1186,23 +1190,59 @@ class ProWindow(QMainWindow):
         if cur_item is not None and cur_item.data(Qt.UserRole) != code:
             self._load_hold(cur_item.data(Qt.UserRole))
 
+    def _clear_hold_mark(self):
+        """撤掉右侧选股票留下的橙底, 并把汇总行恢复成池内统计。"""
+        if not getattr(self, "_hold_mark", None):
+            return
+        self._hold_mark = None
+        for i in range(self.hold_list.count()):
+            it = self.hold_list.item(i)
+            it.setBackground(QColor(0, 0, 0, 0))
+            base = it.data(Qt.UserRole + 1)
+            if base:
+                it.setToolTip(base)      # 去掉追加的「持有 N 期 / 占净值」，别留残影
+        self.hold_meta.setText(getattr(self, "_hold_meta_txt", ""))
+
+    def _on_hold_click(self, item):
+        if item is None:
+            return
+        self._clear_hold_mark()
+        code = item.data(Qt.UserRole)
+        if code and code != self._hold_code:
+            self._load_hold(code)
+
     def _on_hold_pick(self, cur, _prev=None):
         if cur:
+            self._clear_hold_mark()      # 换标的 = 不再看刚才那只股票
             self._load_hold(cur.data(Qt.UserRole))
 
     def _holders_of(self, stock):
-        """反查: 哪些 ETF 的重仓股里有这只票, 按占净值比降序。"""
+        """反查: 哪些 ETF 的披露持仓里有这只票, 按占净值比降序。
+
+        注意这里扫的是库内全部季度, 不是当前看的那一期。季报(Q1/Q3)只披露前十大,
+        中报/年报才是全量; 只按当前季查会漏掉一大堆。返回 [(code, quarter, pct)]。
+        """
         import sqlite3
         try:
             con = sqlite3.connect(str(etf_app.DB))
             try:
-                return con.execute(
-                    "SELECT code, MAX(pct) FROM holding WHERE stock=? "
-                    "GROUP BY code ORDER BY MAX(pct) DESC", (stock,)).fetchall()
+                rows = con.execute(
+                    "SELECT code, quarter, pct FROM holding WHERE stock=?",
+                    (stock,)).fetchall()
             finally:
                 con.close()
         except Exception:
             return []
+        best = {}
+        qset = {}
+        for code, q, pct in rows:
+            pct = pct or 0.0
+            qset.setdefault(code, set()).add(q)
+            cur = best.get(code)
+            if cur is None or pct > cur[1]:     # 同一只 ETF 多期持有, 取占比最高的那期
+                best[code] = (q, pct)
+        return sorted(((c, q, p, qset[c]) for c, (q, p) in best.items()),
+                      key=lambda x: -x[2])
 
     def _hold_stock_click(self, idx):
         """点右边某只股票, 左边列表把持有它的 ETF 标成橙底; 再点一次取消。"""
@@ -1212,16 +1252,16 @@ class ProWindow(QMainWindow):
         r = vrows[idx.row()]
         stock = r["code"]
         if getattr(self, "_hold_mark", None) == stock:
-            self._hold_mark = None
-            self._mark_holders(set(), "")
+            self._clear_hold_mark()
             return
         hits = self._holders_of(stock)
         if not hits:
             self.hold_meta.setText(
-                "%s %s · 本地库里没有别的 ETF 持有它(可能只在这只的持仓里，或那些 ETF 本季只披露前十大)"
+                "%s %s · 池内 134 只有披露的 ETF 里没有别家持有它 —— 不是没显示, "
+                "是它们的季报里确实没有这只票(未持有, 或本季只披露前十大)"
                 % (stock, r["name"]))
             return
-        codes = {c for c, _ in hits}
+        codes = {c for c, _, _, _ in hits}
         # 当前筛选只露出其中几只(或一只都不露)时, 橙底标了也看不出"被这么多家持有",
         # 直接放开筛选再标 —— 用户点这只票就是要看全套持有人
         vis = {self.hold_list.item(i).data(Qt.UserRole)
@@ -1239,23 +1279,37 @@ class ProWindow(QMainWindow):
             self._fill_hold_list()      # 保住当前正在看的那只, 不被重建带走
             self._auto_clear = n_vis
         self._hold_mark = stock
-        self._mark_holders(codes, "%s %s" % (stock, r["name"]), len(hits))
+        detail = {c: (q, p) for c, q, p, _ in hits}
+        cur_q = (self._hold_ctx or {}).get("hit", {}).get("quarter") or ""
+        n_cur = sum(1 for _, _, _, qs in hits if cur_q in qs)
+        label = "%s %s" % (stock, r["name"])
+        self._mark_holders(codes, label, len(hits), detail, n_cur, cur_q)
         if getattr(self, "_auto_clear", None) is not None:
             self.hold_meta.setText(self.hold_meta.text() +
                                    " · 原筛选只露出 %d 只, 已自动切回全部" % self._auto_clear)
             self._auto_clear = None
 
-    def _mark_holders(self, codes, label, n_all=0):
+    def _mark_holders(self, codes, label, n_all=0, detail=None, n_cur=0, cur_q=""):
         n_vis = 0
         first = -1
         for i in range(self.hold_list.count()):
             it = self.hold_list.item(i)
-            hot = it.data(Qt.UserRole) in codes
+            code = it.data(Qt.UserRole)
+            hot = code in codes
             it.setBackground(QColor("#5a4320") if hot else QColor(0, 0, 0, 0))
+            base = it.data(Qt.UserRole + 1) or ""
             if hot:
                 n_vis += 1
                 if first < 0:
                     first = i
+                if detail and code in detail:
+                    q, pct = detail[code]
+                    it.setToolTip("%s\n这只票在本库的持有: %s, 占净值 %.2f%%"
+                                  % (base, self._qlab(q), pct or 0))
+                else:
+                    it.setToolTip(base)
+            elif base:
+                it.setToolTip(base)
         if not codes:
             self.hold_meta.setText(getattr(self, "_hold_meta_txt", "标的 · 点选查看重仓股"))
             return
@@ -1263,9 +1317,20 @@ class ProWindow(QMainWindow):
         if first >= 0:
             self.hold_list.scrollToItem(self.hold_list.item(first),
                                         QAbstractItemView.PositionAtCenter)
+        extra = ""
+        if cur_q:
+            lab = self._qlab(cur_q)
+            if n_cur == n_all:
+                extra = " (本季 %s 这 %d 只全部都在)" % (lab, n_all)
+            elif n_cur == 0:
+                extra = (" (本季 %s 只披露前十大, 这 %d 只全部来自中报/年报全量, "
+                         "不是界面少显示了)" % (lab, n_all))
+            else:
+                extra = (" (本季 %s 只有 %d 只披露到它, 其余 %d 只来自中报/年报全量, "
+                         "不是界面少显示了)" % (lab, n_cur, n_all - n_cur))
         self.hold_meta.setText(
-            "%s 被 %d 只 ETF 持有 · 橙底标出(当前筛选里可见 %d 只) · 双击行跳到仓位最重的"
-            % (label, n_all, n_vis))
+            "%s 被 %d 只 ETF 披露持有%s · 橙底标出, 悬停看是哪一期持有、占净值多少 · 双击行跳到仓位最重的"
+            % (label, n_all, extra))
 
     def _hold_stock_dbl(self, idx):
         """双击右边股票 = 跳到持有它仓位最重的那只 ETF。"""
@@ -1276,6 +1341,7 @@ class ProWindow(QMainWindow):
         if not hits:
             return
         code = hits[0][0]
+        self._clear_hold_mark()      # 双击会先触发一次 clicked 标橙底, 换 ETF 前先撤掉
         self._load_hold(code)
         for i in range(self.hold_list.count()):
             if self.hold_list.item(i).data(Qt.UserRole) == code:
