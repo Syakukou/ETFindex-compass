@@ -172,39 +172,6 @@ class FlowThread(QThread):
         self.done.emit(d)
 
 
-class HoldBatchThread(QThread):
-    """批量取季报持仓: 逐只拉, 拉过的 fetch 会直接命中缓存。"""
-    tick = Signal(int, int, str, int)
-    finished_all = Signal(int, int)
-
-    def __init__(self, codes, db):
-        super().__init__()
-        self.codes = list(codes)
-        self.db = db
-        self._stop = False
-
-    def stop(self):
-        self._stop = True
-
-    def run(self):
-        ok = fail = 0
-        for i, code in enumerate(self.codes):
-            if self._stop:
-                break
-            try:
-                h = etf_hold.fetch(code, self.db)
-                n = len(h.get("rows") or [])
-            except Exception:
-                n = -1
-            if n > 0:
-                ok += 1
-            elif n == 0:
-                fail += 1
-            self.tick.emit(i + 1, len(self.codes), code, n)
-            self.msleep(120)
-        self.finished_all.emit(ok, fail)
-
-
 class InstThread(QThread):
     """拉季度机构持仓(社保/QFII/保险/券商/信托/基金) + 陆股通持股。"""
     tick = Signal(str)
@@ -1033,20 +1000,12 @@ class ProWindow(QMainWindow):
         b2.setToolTip("把当前表格按屏幕顺序复制成制表符分隔文本, 可直接贴进 Excel / 文档")
         b2.clicked.connect(self._copy_hold)
         hb.addWidget(b2)
-        left.addLayout(hb)
-        hb2 = QHBoxLayout()
-        self.hold_batch = QPushButton(" 补全缺失 ")
-        self.hold_batch.setToolTip("只补全池内还没有明细的 ETF, 按缺口数显示(不受上面分类/搜索影响)。\n"
-                                   "已经有明细的不会重抓 —— 想让某只重抓, 选中它点「重取该只」。\n"
-                                   "没有缺口时按钮自动置灰。")
-        self.hold_batch.clicked.connect(self._batch_hold)
-        hb2.addWidget(self.hold_batch)
         self.hold_inst = QPushButton(" 刷新机构 ")
         self.hold_inst.setToolTip("重新拉季度机构持仓(社保/QFII/保险/券商/信托/基金)与陆股通持股,\n"
                                   "一次覆盖全市场, 约 40 秒。已有缓存时直接读本地库, 不必点它")
         self.hold_inst.clicked.connect(self._refresh_inst)
-        hb2.addWidget(self.hold_inst)
-        left.addLayout(hb2)
+        hb.addWidget(self.hold_inst)
+        left.addLayout(hb)
         hb3 = QHBoxLayout()
         b3 = QPushButton(" 列宽缩到一屏 ")
         b3.setToolTip("把 18 列按比例压进当前窗口宽度, 一屏看完不用拖;\n"
@@ -1125,12 +1084,10 @@ class ProWindow(QMainWindow):
         lay.addLayout(right, 1)
         self._hold_code = None
         self._hold_hit = None
-        self._hold_thread = None
         self._inst_thread = None
         self._inst_cache = None
         self._hold_vrows = []
         self._hold_ctx = {}
-        self._hold_missing = []
         self._hold_mark = None
         self._hold_meta_txt = ""
         self._hold_fitted = False
@@ -1165,23 +1122,39 @@ class ProWindow(QMainWindow):
             ok = e["code"] in has
             n_has += 1 if ok else 0
             nrow = cnt.get(e["code"]) or 0
-            it = QListWidgetItem("%s %s %s%s" % (
-                "●" if ok else "○", e["code"], e["name"],
-                ("  %d" % nrow) if ok else ""))
+            # ○ 的项要写明"为什么没有": 待上市 / 季报里本来就不含股票
+            if ok:
+                tail = "  %d" % nrow
+            elif e.get("listed") is False:
+                tail = "  · 待上市"
+            else:
+                tail = "  · 无股票持仓"
+            it = QListWidgetItem("%s %s %s%s" % ("●" if ok else "○", e["code"], e["name"], tail))
             it.setData(Qt.UserRole, e["code"])
             it.setForeground(QColor(TXT if ok else SUB))
-            it.setToolTip("%s\n%s" % (
-                e["category"],
-                ("已有季报持仓明细, 最新季度 %d 只" % nrow) if ok
-                else "还没取过, 点「补全全部」或选中它会自动取"))
+            if ok:
+                tip = "%s\n已有季报持仓明细, 最新季度 %d 只" % (e["category"], nrow)
+            elif e.get("listed") is False:
+                tip = "%s\n%s\n还没上市, 没有行情也没有持仓, 等它上市后会自己出现在这里" % (
+                    e["category"], e.get("note") or "")
+            else:
+                tip = ("%s\n这只不披露股票持仓(货币/黄金/商品/跨境类), 季报里只有基金资产构成, 不是抓漏"
+                       % e["category"])
+            it.setToolTip(tip)
             self.hold_list.addItem(it)
-        miss = [e["code"] for e in a.etfs if e["code"] not in has]
-        self._hold_missing = miss
-        self.hold_batch.setEnabled(bool(miss))
-        self.hold_batch.setText(" 补全缺失 %d 只 " % len(miss) if miss else " 已无缺口 ")
-        self._hold_meta_txt = ("当前列表 %d 只 · 有明细 %d 只 · 池 %d 只"
-                              % (n_all, n_has, len(a.etfs)))
+        pool = len(a.etfs)
+        n_listed = sum(1 for e in a.etfs if e.get("listed") is False)
+        n_nostock = pool - len(has & {e["code"] for e in a.etfs}) - n_listed
+        self._hold_meta_txt = ("当前列表 %d 只 · 有股票明细 %d 只 ｜ 池 %d = 有明细 %d + "
+                               "待上市 %d + 无股票持仓 %d"
+                               % (n_all, n_has, pool,
+                                  len(has & {e["code"] for e in a.etfs}), n_listed, n_nostock))
         self.hold_meta.setText(self._hold_meta_txt)
+        self.hold_meta.setToolTip(
+            "无股票持仓的 %d 只是货币/黄金/白银/商品期货/跨境类, 基金季报只披露资产构成, "
+            "本来就没有股票明细, 不是抓取失败。待上市的 %d 只东财还没有行情与持仓。\n"
+            "两只都没有可补的东西, 所以这里不设批量补全按钮; 想重抓当前这只, 点「重取该只」。" %
+            (n_nostock, n_listed))
         self._hold_mark = None
         code = self._hold_code
         hit = -1
@@ -1234,7 +1207,7 @@ class ProWindow(QMainWindow):
         hits = self._holders_of(stock)
         if not hits:
             self.hold_meta.setText(
-                "%s %s · 本地库里没有别的 ETF 持有它(可能只在这只的持仓里，或那些 ETF 还没补全)"
+                "%s %s · 本地库里没有别的 ETF 持有它(可能只在这只的持仓里，或那些 ETF 本季只披露前十大)"
                 % (stock, r["name"]))
             return
         codes = {c for c, _ in hits}
@@ -1622,52 +1595,6 @@ class ProWindow(QMainWindow):
         txt = etf_hold.copy_text(hit, hit.get("name", ""))
         QApplication.clipboard().setText(txt)
         self.hold_note.setText("已复制 %d 行到剪贴板(按当前排序)。" % len(hit.get("rows") or []))
-
-    def _batch_hold(self):
-        th = getattr(self, "_hold_thread", None)
-        if th and th.isRunning():
-            th.stop()
-            self.hold_batch.setText(" 停… ")
-            return
-        # 只补缺口: 已有明细的不重抓(缓存 10 天内直接命中, 重抓纯浪费请求)
-        codes = list(getattr(self, "_hold_missing", None) or [])
-        if not codes:
-            self.hold_note.setText(
-                "池内 %d 只全部已有持仓明细, 没有可补的。想让某只重抓, 选中它点「重取该只」。"
-                % len(self.analyzer.etfs))
-            return
-        self._hold_ok = 0
-        th = HoldBatchThread(codes, str(etf_app.DB))
-        th.tick.connect(self._batch_tick)
-        th.finished_all.connect(self._batch_done)
-        self._hold_thread = th
-        self.hold_batch.setText(" 停止 0/%d " % len(codes))
-        self.hold_note.setText(
-            "开始补 %d 只没有明细的(不受当前筛选影响)…已有明细的不重抓, "
-            "进度看按钮与状态栏, 可随时再点一次停止。" % len(codes))
-        th.start()
-
-    def _batch_tick(self, i, total, code, n):
-        self.hold_batch.setText(" 停止 %d/%d " % (i, total))
-        self.status.setText("补全持仓 %d/%d · %s %s"
-                            % (i, total, code,
-                               "%d 行" % n if n > 0 else ("无股票明细" if n == 0 else "取数失败")))
-        if i % 10 == 0 or i == total:
-            self.hold_note.setText("补全中 %d/%d …" % (i, total))
-
-    def _batch_done(self, ok, fail):
-        self._fill_hold_list()          # 按钮文案在这里按新缺口重算
-        try:
-            n_has = len(etf_hold.cached_codes(str(etf_app.DB)))
-        except Exception:
-            n_has = 0
-        self.hold_note.setText(
-            "补全结束: 这次补了 %d 只, 其中 %d 只有股票明细、%d 只没有"
-            "(货币/债券/黄金/商品/部分跨境/未上市本来就没有股票持仓)。"
-            "库里现在共 %d 只 ETF 有明细; 已有明细的一律没重抓。"
-            "注意行数少不等于抓漏 —— 季报只披露前十大, 全量在中报/年报那期, 用上方「季度」切过去看。"
-            % (ok + fail, ok, fail, n_has))
-        self.status.setText("补全完成 · 本次 %d 只 · 库里共 %d 只有明细" % (ok + fail, n_has))
 
     def _refresh_inst(self):
         th = getattr(self, "_inst_thread", None)
