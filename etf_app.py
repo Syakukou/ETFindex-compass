@@ -3,11 +3,13 @@
 ETF 跟踪面板 - 本地独立软件
 - 双击 start_etf_app.bat 启动, 自动打开浏览器
 - 服务端: 标准库 http.server + SQLite, 无额外依赖
-- 数据源: akshare(东财), 行情快照 + 日K历史
+- 数据源: 公开行情接口(东财), 行情快照 + 日K历史
 - 指标: 前端计算 MA / MACD / BOLL, 后端供原始K线与快照
 """
 import json
 import sqlite3
+
+import brand
 import threading
 import time
 import webbrowser
@@ -78,7 +80,7 @@ def refresh_data(codes=None):
     try:
         import akshare as ak
     except ImportError as e:
-        return 0, [f"akshare 未安装: {e}"]
+        return 0, [f"行情数据接口库未安装: {e}"]
 
     etfs = load_etfs()
     errors, ok = [], 0
@@ -129,7 +131,7 @@ def refresh_data(codes=None):
                  _f(r.get("换手率")), _f(r.get("量比")), iopv,
                  round((close - iopv) / iopv * 100, 3) if iopv else None,
                  round(_f(r.get("主力净流入-净额")) / 1e4, 1),
-                 round(_f(r.get("最新份额")) / 1e8, 2), "akshare", now))
+                 round(_f(r.get("最新份额")) / 1e8, 2), brand.SOURCE_TAG, now))
             ok += 1
         conn.commit()
 

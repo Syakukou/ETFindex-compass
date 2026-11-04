@@ -125,7 +125,7 @@ def fetch_idx_kline(secid, lmt=90, timeout=12):
 
 # ---------------------------------------------------------------- 期货
 def fetch_futures():
-    """{IH: {...}} 主力连续, 含基差。akshare 的 futures_main_sina 给的即持仓最大合约。"""
+    """{IH: {...}} 主力连续, 含基差。公开接口给的即持仓最大合约。"""
     import akshare as ak
     out = {}
     for sym in FUT:

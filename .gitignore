@@ -5,6 +5,11 @@ start_*.bat
 *.db-journal
 *.db-wal
 
+# ---- 自用工具，只在本地用，不随发布版出去 ----
+etf_tracker.py
+validate_codes.py
+ETFQuant.spec
+
 # ---- 虚拟环境 ----
 envs/
 venv/
@@ -33,3 +38,9 @@ Thumbs.db
 .libtv/
 *.log
 ~$*
+
+# ---- 界面截图（本地留档，不进仓库） ----
+ui_preview.png
+final_flow.png
+idx_preview.png
+shot_hold4.png

@@ -36,10 +36,12 @@ import etf_flow  # noqa: E402
 import etf_hold  # noqa: E402
 import etf_inst  # noqa: E402
 
-# 暗色终端配色
-BG = "#161a23"; PANEL = "#1e222d"; PANEL2 = "#232834"
-TXT = "#d1d4dc"; SUB = "#787b86"; UP = "#e05252"; DOWN = "#3fb68b"
-ACCENT = "#4a8cff"; GRID = "#2a2e39"; WARN = "#e6a23c"
+# 主题与品牌: 自用版 / 发布版共用一套逻辑, 外观由 brand 决定
+import brand  # noqa: E402
+
+BG = brand.BG; PANEL = brand.PANEL; PANEL2 = brand.PANEL2
+TXT = brand.TXT; SUB = brand.SUB; UP = brand.UP; DOWN = brand.DOWN
+ACCENT = brand.ACCENT; GRID = brand.GRID; WARN = brand.WARN
 
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
 matplotlib.rcParams["axes.unicode_minus"] = False
@@ -170,16 +172,17 @@ class FlowThread(QThread):
         except Exception as e:
             d = {"rows": [], "err": ["%s: %s" % (type(e).__name__, e)]}
         # 打包成窗口程序后 stderr 看不见, 取数失败只会表现为"整页空白";
-        # 这里落一行日志到 exe 同级, 出问题能直接翻原因
-        try:
-            import time as _t
-            with open(str(Path(etf_app.DB).parent / "flow_debug.log"), "a",
-                      encoding="utf-8") as f:
-                f.write("[%s] rows=%d fut=%d opt=%d err=%s\n" % (
-                    _t.strftime("%Y-%m-%d %H:%M:%S"), len(d.get("rows") or []),
-                    len(d.get("fut") or {}), len(d.get("opt") or {}), d.get("err")))
-        except Exception:
-            pass
+        # 自用版落一行日志到 exe 同级, 出问题能直接翻原因。发布版不写。
+        if not brand.PUBLISH:
+            try:
+                import time as _t
+                with open(str(Path(etf_app.DB).parent / "flow_debug.log"), "a",
+                          encoding="utf-8") as f:
+                    f.write("[%s] rows=%d fut=%d opt=%d err=%s\n" % (
+                        _t.strftime("%Y-%m-%d %H:%M:%S"), len(d.get("rows") or []),
+                        len(d.get("fut") or {}), len(d.get("opt") or {}), d.get("err")))
+            except Exception:
+                pass
         self.done.emit(d)
 
 
@@ -237,7 +240,7 @@ class ChartWidget(QWidget):
 class ProWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ETF 量化分析终端")
+        self.setWindowTitle(brand.TITLE)
         self.resize(1460, 980)
         self.analyzer = None
         self.refreshing = False
@@ -338,7 +341,7 @@ class ProWindow(QMainWindow):
         self.score_tbl.clicked.connect(self._pick_from_score)
         self.score_tbl.doubleClicked.connect(self._on_score_dbl)
         lay.addWidget(self.score_tbl)
-        self.tabs.addTab(w, " 评分排名 ")
+        self.tabs.addTab(w, brand.TABS["rank"])
 
     def _tab_kline(self):
         w = QWidget()
@@ -371,7 +374,7 @@ class ProWindow(QMainWindow):
         right.addWidget(self.kchart, 1)
         rw = QWidget(); rw.setLayout(right)
         lay.addWidget(rw, 1)
-        self.tabs.addTab(w, " K线图表 ")
+        self.tabs.addTab(w, brand.TABS["kline"])
 
     def _tab_corr(self):
         w = QWidget()
@@ -476,7 +479,7 @@ class ProWindow(QMainWindow):
         # 换范围/换窗口立刻重算: 以前只认「重算」按钮, 选了「全部」看着还是那几个
         self.corr_scope.currentIndexChanged.connect(lambda _: self._corr_reset())
         self.corr_days.currentIndexChanged.connect(lambda _: self._corr_reset())
-        self.tabs.addTab(w, " 相关性矩阵 ")
+        self.tabs.addTab(w, brand.TABS["corr"])
 
     def _corr_reset(self):
         """换范围/窗口后旧的那对标的已不在同一张表里, 先清掉再重算。"""
@@ -590,7 +593,7 @@ class ProWindow(QMainWindow):
         self.risk_chart.canvas.mpl_connect("button_press_event", self._risk_click)
         self.risk_chart.canvas.mpl_connect("motion_notify_event", self._risk_hover)
         self.risk_chart.canvas.mpl_connect("resize_event", self._risk_resize)
-        self.tabs.addTab(w, " 风险收益 ")
+        self.tabs.addTab(w, brand.TABS["risk"])
 
     # ---- 散点交互: 点选看名称, 双击跳 K线
     def _risk_hit(self, ev, tol=13):
@@ -757,7 +760,7 @@ class ProWindow(QMainWindow):
         self.rot_bar.canvas.mpl_connect("button_press_event", self._rot_click)
         self._rot_names = []
         self._rot_axes = []
-        self.tabs.addTab(w, " 板块轮动 ")
+        self.tabs.addTab(w, brand.TABS["rot"])
 
     # ---- 排序 / 点选
     @property
@@ -972,7 +975,7 @@ class ProWindow(QMainWindow):
         rv.addWidget(tw)
         h.addWidget(rw, 1)
 
-        self.tabs.addTab(w, " 指数·ETF进出 ")
+        self.tabs.addTab(w, brand.TABS["flow"])
         self.idx_groups = []
         self.cur_idx = None
         self.det_sort, self.det_desc = None, True
@@ -1106,7 +1109,7 @@ class ProWindow(QMainWindow):
         self._hold_meta_txt = ""
         self._hold_fitted = False
         self._hold_sort = (0, False)      # (列, 是否降序), 默认按排名升序
-        self.tabs.addTab(w, " ETF成分股 ")
+        self.tabs.addTab(w, brand.TABS["hold"])
 
     def _fill_hold_list(self):
         a = self.analyzer

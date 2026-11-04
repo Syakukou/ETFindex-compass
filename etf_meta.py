@@ -102,7 +102,7 @@ def looks_qdii(name):
 
 
 def ensure_list(spot, base_dir):
-    """spot: akshare fund_etf_spot_em() 的 DataFrame。返回 (清单, 变动说明)"""
+    """spot: 行情快照接口返回的 DataFrame。返回 (清单, 变动说明)"""
     path = os.path.join(base_dir, "etf_list.json")
     old = {}
     if os.path.exists(path):
