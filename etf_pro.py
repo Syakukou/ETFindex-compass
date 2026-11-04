@@ -107,6 +107,23 @@ def short_name(n, k=8):
     return s if len(s) <= k else s[:k - 1] + "…"
 
 
+def hit_axs(ev, axs):
+    """点击是否落在这几个轴的地盘上, 用像素框判定。
+
+    不能用 ev.inaxes: ax.twinx() 会盖在主轴上, 事件命中的是最上层那个
+    (比如资金柱上的基差轴、K线上的均线轴), inaxes 不等于主轴, 点哪都没反应。
+    """
+    if ev.x is None or ev.y is None:
+        return False
+    for a in axs:
+        try:
+            if a.bbox.contains(ev.x, ev.y):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _ffill(vals):
     """按日期对齐后补空值: 跨境指数比 A 股少一个交易日, 缺的那天沿用前收。
 
@@ -526,11 +543,11 @@ class ProWindow(QMainWindow):
             "横轴=这段时间抖了多少(区间波动幅度), 纵轴=这段涨跌。\n"
             "左上=涨得多、抖得少; 右下=又抖又亏。颜色=收益÷波动,\n"
             "红(≥1)=赚的比抖的多, 绿(负)=白担风险。\n"
-            "单击圆点=看是哪只, 双击=跳到K线; 右边表是散点里全部标的的清单。")
+            "点圆点 → 下表自动滚到该行并高亮; 点表格行 → 图上圈出该点, 两边随时对得上。\n"
+            "双击圆点或表格行 = 跳去K线。下表列的是散点里的全部标的。")
         lbl.setWordWrap(True)
         lbl.setObjectName("meta")
         left.addWidget(lbl)
-
         row = QHBoxLayout()
         row.addWidget(QLabel("区间"))
         self.risk_win = QComboBox()
@@ -637,6 +654,9 @@ class ProWindow(QMainWindow):
             return
         self._risk_sel = p["code"]
         self.draw_risk()
+        self.status.setText("%s (%s) · %s %+.2f%% · 波动 %.2f%% · 收益/波动 %s · 已定位到下表"
+                            % (p["name"], p["code"], self.risk_win.currentText(),
+                               p["ret"], p["amp"] or 0, n0(p["ratio"], 2)))
 
     def _risk_hover(self, ev):
         if ev.inaxes is None or self._risk_ax is None:
@@ -779,9 +799,9 @@ class ProWindow(QMainWindow):
 
     def _rot_click(self, ev):
         """点柱图任一根柱 = 选中左侧同一行; 数据用当前窗口的口径。"""
-        if getattr(ev, "button", 1) != 1 or ev.inaxes is None:
+        if getattr(ev, "button", 1) != 1:
             return
-        if ev.inaxes not in getattr(self, "_rot_axes", []):
+        if not hit_axs(ev, getattr(self, "_rot_axes", [])):
             return
         names = getattr(self, "_rot_names", [])
         if not names or ev.ydata is None:
@@ -1008,9 +1028,10 @@ class ProWindow(QMainWindow):
         hb.addWidget(b2)
         left.addLayout(hb)
         hb2 = QHBoxLayout()
-        self.hold_batch = QPushButton(" 补全全部 ")
-        self.hold_batch.setToolTip("对池内全部 168 只逐个拉季报持仓(不受上面分类/搜索筛选影响),\n"
-                                   "已有明细的会跳过; 168 只约 1-2 分钟, 再点一次可停止")
+        self.hold_batch = QPushButton(" 补全缺失 ")
+        self.hold_batch.setToolTip("只补全池内还没有明细的 ETF, 按缺口数显示(不受上面分类/搜索影响)。\n"
+                                   "已经有明细的不会重抓 —— 想让某只重抓, 选中它点「重取该只」。\n"
+                                   "没有缺口时按钮自动置灰。")
         self.hold_batch.clicked.connect(self._batch_hold)
         hb2.addWidget(self.hold_batch)
         self.hold_inst = QPushButton(" 刷新机构 ")
@@ -1043,6 +1064,18 @@ class ProWindow(QMainWindow):
         self.hold_src.setObjectName("meta")
         self.hold_src.setWordWrap(True)
         right.addWidget(self.hold_src)
+        qrow = QHBoxLayout()
+        qrow.setSpacing(5)
+        ql = QLabel("季度")
+        ql.setObjectName("meta")
+        qrow.addWidget(ql)
+        self.hold_q = QComboBox()
+        self.hold_q.setToolTip("季报(1季/3季)只披露前十大, 中报/年报才是全部持仓。\n"
+                               "库里每一期都存着, 这里按当期行数标出来, 想看全量就切到中报那期。")
+        self.hold_q.currentIndexChanged.connect(self._on_hold_q)
+        qrow.addWidget(self.hold_q, 1)
+        right.addLayout(qrow)
+        self._hold_q_guard = False
         ht = QTableWidget()
         hcols = [("rank", "排名", 40), ("stock", "代码", 74), ("sname", "名称", 96),
                  ("pct", "占净值%", 62), ("wchg", "环比pp", 56),
@@ -1075,6 +1108,8 @@ class ProWindow(QMainWindow):
         ht.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         ht.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)   # 18 列总宽超过窗口时必须能拖出来
         self.hold_tbl = ht
+        ht.clicked.connect(self._hold_stock_click)
+        ht.doubleClicked.connect(self._hold_stock_dbl)
         right.addWidget(ht, 1)
         self.hold_note = QLabel("")
         self.hold_note.setWordWrap(True)
@@ -1088,6 +1123,9 @@ class ProWindow(QMainWindow):
         self._inst_cache = None
         self._hold_vrows = []
         self._hold_ctx = {}
+        self._hold_missing = []
+        self._hold_mark = None
+        self._hold_meta_txt = ""
         self._hold_fitted = False
         self._hold_sort = (0, False)      # (列, 是否降序), 默认按排名升序
         self.tabs.addTab(w, " ETF成分股 ")
@@ -1130,8 +1168,14 @@ class ProWindow(QMainWindow):
                 ("已有季报持仓明细, 最新季度 %d 只" % nrow) if ok
                 else "还没取过, 点「补全全部」或选中它会自动取"))
             self.hold_list.addItem(it)
-        self.hold_meta.setText("当前列表 %d 只 · 有明细 %d 只 · 池 %d 只"
-                               % (n_all, n_has, len(a.etfs)))
+        miss = [e["code"] for e in a.etfs if e["code"] not in has]
+        self._hold_missing = miss
+        self.hold_batch.setEnabled(bool(miss))
+        self.hold_batch.setText(" 补全缺失 %d 只 " % len(miss) if miss else " 已无缺口 ")
+        self._hold_meta_txt = ("当前列表 %d 只 · 有明细 %d 只 · 池 %d 只"
+                              % (n_all, n_has, len(a.etfs)))
+        self.hold_meta.setText(self._hold_meta_txt)
+        self._hold_mark = None
         code = self._hold_code
         hit = -1
         for i in range(self.hold_list.count()):
@@ -1155,7 +1199,104 @@ class ProWindow(QMainWindow):
         if cur:
             self._load_hold(cur.data(Qt.UserRole))
 
-    def _load_hold(self, code=None, force=False):
+    def _holders_of(self, stock):
+        """反查: 哪些 ETF 的重仓股里有这只票, 按占净值比降序。"""
+        import sqlite3
+        try:
+            con = sqlite3.connect(str(etf_app.DB))
+            try:
+                return con.execute(
+                    "SELECT code, MAX(pct) FROM holding WHERE stock=? "
+                    "GROUP BY code ORDER BY MAX(pct) DESC", (stock,)).fetchall()
+            finally:
+                con.close()
+        except Exception:
+            return []
+
+    def _hold_stock_click(self, idx):
+        """点右边某只股票, 左边列表把持有它的 ETF 标成橙底; 再点一次取消。"""
+        vrows = self._hold_vrows or []
+        if not (0 <= idx.row() < len(vrows)):
+            return
+        r = vrows[idx.row()]
+        stock = r["code"]
+        if getattr(self, "_hold_mark", None) == stock:
+            self._hold_mark = None
+            self._mark_holders(set(), "")
+            return
+        hits = self._holders_of(stock)
+        if not hits:
+            self.hold_meta.setText(
+                "%s %s · 本地库里没有别的 ETF 持有它(可能只在这只的持仓里，或那些 ETF 还没补全)"
+                % (stock, r["name"]))
+            return
+        self._hold_mark = stock
+        self._mark_holders({c for c, _ in hits},
+                           "%s %s" % (stock, r["name"]), len(hits))
+
+    def _mark_holders(self, codes, label, n_all=0):
+        n_vis = 0
+        for i in range(self.hold_list.count()):
+            it = self.hold_list.item(i)
+            hot = it.data(Qt.UserRole) in codes
+            it.setBackground(QColor("#5a4320") if hot else QColor(0, 0, 0, 0))
+            if hot:
+                n_vis += 1
+        if not codes:
+            self.hold_meta.setText(getattr(self, "_hold_meta_txt", "标的 · 点选查看重仓股"))
+            return
+        self.hold_meta.setText(
+            "%s 被 %d 只 ETF 持有 · 橙底标出(当前筛选里可见 %d 只) · 双击行跳到仓位最重的"
+            % (label, n_all, n_vis))
+
+    def _hold_stock_dbl(self, idx):
+        """双击右边股票 = 跳到持有它仓位最重的那只 ETF。"""
+        vrows = self._hold_vrows or []
+        if not (0 <= idx.row() < len(vrows)):
+            return
+        hits = self._holders_of(vrows[idx.row()]["code"])
+        if not hits:
+            return
+        code = hits[0][0]
+        self._load_hold(code)
+        for i in range(self.hold_list.count()):
+            if self.hold_list.item(i).data(Qt.UserRole) == code:
+                self.hold_list.setCurrentRow(i)
+                break
+
+    @staticmethod
+    def _qlab(q):
+        """'2026年3季度股票投资明细' -> '2026Q3'"""
+        s = str(q)
+        if "股票投资明细" in s:
+            return s.replace("年", "Q").replace("季度股票投资明细", "")
+        return s or "—"
+
+    def _fill_hold_q(self, hit):
+        """季度下拉。每期都标出当期行数, 季报 15 只 / 中报 100 只一眼能看出来。"""
+        qs = hit.get("quarters") or []
+        cnt = hit.get("qcount") or {}
+        cur = hit.get("quarter") or ""
+        self._hold_q_guard = True
+        self.hold_q.blockSignals(True)
+        self.hold_q.clear()
+        for q in reversed(qs):          # 新期在前
+            self.hold_q.addItem("%s · %d 只" % (self._qlab(q), cnt.get(q, 0)), q)
+        i = self.hold_q.findData(cur)
+        if i >= 0:
+            self.hold_q.setCurrentIndex(i)
+        self.hold_q.blockSignals(False)
+        self._hold_q_guard = False
+        self.hold_q.setEnabled(self.hold_q.count() > 1)
+
+    def _on_hold_q(self, _i=0):
+        if getattr(self, "_hold_q_guard", False):
+            return
+        q = self.hold_q.currentData()
+        if q and self._hold_code:
+            self._load_hold(self._hold_code, quarter=q)
+
+    def _load_hold(self, code=None, force=False, quarter=None):
         a = self.analyzer
         if not a:
             return
@@ -1167,12 +1308,13 @@ class ProWindow(QMainWindow):
         name = e["name"] if e else code
         label = "%s %s" % (code, name)
         try:
-            hit = etf_hold.fetch(code, str(etf_app.DB), force=force)
+            hit = etf_hold.fetch(code, str(etf_app.DB), force=force, quarter=quarter)
         except Exception as ex:
             self.hold_title.setText("%s · 取持仓失败: %s: %s" % (label, type(ex).__name__, ex))
             self._hold_vrows = []
             self.hold_tbl.setRowCount(0)
             return
+        self._fill_hold_q(hit)
         self._hold_hit = dict(hit, name=name)
         rows = hit.get("rows") or []
         if not rows:
@@ -1224,7 +1366,11 @@ class ProWindow(QMainWindow):
                 hsgt=ratio, mflow=q0.get("mflow"), has_q=bool(q0),
                 inst=txt, inst_tip=long, inst_n=i_n, ind=q0.get("ind")))
         self._hold_vrows = vrows
+        cnt = hit.get("qcount") or {}
+        # 全量期优先取最近的一期(中报/年报都是全量, 别把去年中报当参考)
+        bestq = max(cnt, key=lambda x: (cnt[x], etf_hold._qkey(x))) if cnt else ""
         self._hold_ctx = dict(hit=hit, idate=idate, n_new=n_new, idate_ok=bool(idate),
+                              q_best=(cnt.get(bestq, 0), bestq), q_cur=q,
                               foreign=sum(1 for r in rows
                                           if not (len(r["stock"]) == 6 and r["stock"].isdigit())))
         self._apply_hold_sort(render=False)
@@ -1311,6 +1457,12 @@ class ProWindow(QMainWindow):
         note = ("口径: 东财基金持仓(季报披露, 滞后于最新持仓); 环比=与上一季度占净值比之差(百分点); "
                 "北向=十大流通股东里的香港中央结算 ÷ 当前流通股本(近似); "
                 "机构=社保险资等家数, 取自东财机构持仓, 报告期 %s。" % (idate or "—"))
+        bn, bq = ctx.get("q_best") or (0, "")
+        if bq and bn > len(vrows):
+            note += (" 本期 %s 只披露前十大, 共 %d 只; %s 是全量持仓 %d 只, "
+                     "上方「季度」切过去就能看全部。"
+                     % (self._qlab(ctx.get("q_cur") or ""), len(vrows),
+                        self._qlab(bq), bn))
         if ctx.get("n_new"):
             note += (" 标「新」的 %d 只: 上季明细里没有它 —— 可能真新进, 也可能上季披露不到它"
                      "(上季披露 %d 只 / 本季 %d 只)。"
@@ -1443,9 +1595,12 @@ class ProWindow(QMainWindow):
             th.stop()
             self.hold_batch.setText(" 停… ")
             return
-        # 补全永远按全池走, 不受上面的分类/搜索筛选影响 (以前只补当前列表, 看着像没生效)
-        codes = [e["code"] for e in self.analyzer.etfs]
+        # 只补缺口: 已有明细的不重抓(缓存 10 天内直接命中, 重抓纯浪费请求)
+        codes = list(getattr(self, "_hold_missing", None) or [])
         if not codes:
+            self.hold_note.setText(
+                "池内 %d 只全部已有持仓明细, 没有可补的。想让某只重抓, 选中它点「重取该只」。"
+                % len(self.analyzer.etfs))
             return
         self._hold_ok = 0
         th = HoldBatchThread(codes, str(etf_app.DB))
@@ -1454,7 +1609,7 @@ class ProWindow(QMainWindow):
         self._hold_thread = th
         self.hold_batch.setText(" 停止 0/%d " % len(codes))
         self.hold_note.setText(
-            "开始补全全部 %d 只(池内所有标的, 不管当前筛选)…已有明细的会跳过, "
+            "开始补 %d 只没有明细的(不受当前筛选影响)…已有明细的不重抓, "
             "进度看按钮与状态栏, 可随时再点一次停止。" % len(codes))
         th.start()
 
@@ -1467,17 +1622,18 @@ class ProWindow(QMainWindow):
             self.hold_note.setText("补全中 %d/%d …" % (i, total))
 
     def _batch_done(self, ok, fail):
-        self.hold_batch.setText(" 补全全部 ")
-        self._fill_hold_list()
+        self._fill_hold_list()          # 按钮文案在这里按新缺口重算
         try:
             n_has = len(etf_hold.cached_codes(str(etf_app.DB)))
         except Exception:
             n_has = 0
         self.hold_note.setText(
-            "补全结束: 本轮有明细 %d 只, 无股票明细/失败 %d 只。"
-            "本地库现有 %d 只可查明细(● 亮色), ○ 灰的是本来就没有股票持仓的"
-            "(货币/债券/黄金/商品/部分跨境/未上市)。" % (ok, fail, n_has))
-        self.status.setText("持仓补全完成 · 本地 %d 只" % n_has)
+            "补全结束: 这次补了 %d 只, 其中 %d 只有股票明细、%d 只没有"
+            "(货币/债券/黄金/商品/部分跨境/未上市本来就没有股票持仓)。"
+            "库里现在共 %d 只 ETF 有明细; 已有明细的一律没重抓。"
+            "注意行数少不等于抓漏 —— 季报只披露前十大, 全量在中报/年报那期, 用上方「季度」切过去看。"
+            % (ok + fail, ok, fail, n_has))
+        self.status.setText("补全完成 · 本次 %d 只 · 库里共 %d 只有明细" % (ok + fail, n_has))
 
     def _refresh_inst(self):
         th = getattr(self, "_inst_thread", None)
@@ -1958,9 +2114,9 @@ class ProWindow(QMainWindow):
     def _flow_click(self, ev):
         """点走势图/资金柱任一处: 竖线定位 + 当日收盘、涨跌、资金动能。"""
         ctx = getattr(self, "_flow_ctx", None)
-        if not ctx or ev.inaxes is None or ev.xdata is None:
+        if not ctx or ev.xdata is None:
             return
-        if ev.inaxes not in ctx["axs"]:
+        if not hit_axs(ev, ctx["axs"]):
             return
         i = int(round(ev.xdata))
         if not (0 <= i < len(ctx["dates"])):
@@ -1971,8 +2127,17 @@ class ProWindow(QMainWindow):
             except Exception:
                 pass
         self._flow_marks = []
-        ax = ctx["axs"][0]
-        ln = ax.axvline(i, color=ACCENT, lw=0.9, alpha=0.9, zorder=8)
+        ax0 = ctx["axs"][0]
+        # 点在哪块就用哪块的坐标放框: 点资金柱贴柱子, 点收盘线贴收盘点
+        hit = ax0
+        for a in ctx["axs"]:
+            try:
+                if a.bbox.contains(ev.x, ev.y):
+                    hit = a
+                    break
+            except Exception:
+                continue
+        ln = ax0.axvline(i, color=ACCENT, lw=0.9, alpha=0.9, zorder=8)
         close = ctx["close"][i]
         prev = ctx["close"][i - 1] if i > 0 else close
         chg = (close / prev - 1) * 100 if (prev and close) else 0.0
@@ -1980,13 +2145,19 @@ class ProWindow(QMainWindow):
             ctx["dates"][i], "—" if close is None else "%.3f" % close, chg)
         if ctx.get("mom"):
             txt += "\n资金动能 %+.2f 亿" % ctx["mom"][i]
+            # 5日动能是滚动的, 再加一句相对上一根的增减, 看的是加速还是减速
+            if i > 0:
+                txt += " (较前日 %+.2f)" % (ctx["mom"][i] - ctx["mom"][i - 1])
         right = i > len(ctx["dates"]) * 0.66
-        box = ax.annotate(txt, xy=(i, close if close else 0),
-                          xytext=(-9 if right else 9, 4), textcoords="offset points",
-                          fontsize=7.6, color=TXT, va="top",
-                          ha="right" if right else "left",
-                          bbox=dict(boxstyle="round,pad=0.4", fc=PANEL2, ec=ACCENT,
-                                    lw=0.8, alpha=0.95), zorder=9)
+        yv = close if close else 0
+        if hit is not ax0 and ctx.get("mom"):
+            yv = ctx["mom"][i]
+        box = hit.annotate(txt, xy=(i, yv),
+                           xytext=(-9 if right else 9, 4), textcoords="offset points",
+                           fontsize=7.6, color=TXT, va="top",
+                           ha="right" if right else "left",
+                           bbox=dict(boxstyle="round,pad=0.4", fc=PANEL2, ec=ACCENT,
+                                     lw=0.8, alpha=0.95), zorder=9)
         self._flow_marks = [ln, box]
         self.flow_chart.draw()
         self.status.setText("%s %s · 收 %s · %+.2f%%%s"
@@ -2318,9 +2489,9 @@ class ProWindow(QMainWindow):
     def _kline_click(self, ev):
         """点 K 线任意位置: 竖线定位 + 当日开高低收/涨跌/量/均线数值。"""
         ctx = getattr(self, "_k_ctx", None)
-        if not ctx or ev.inaxes is None or ev.xdata is None:
+        if not ctx or ev.xdata is None:
             return
-        if ev.inaxes not in ctx["axs"]:
+        if not hit_axs(ev, ctx["axs"]):
             return
         i = int(round(ev.xdata))
         if not (0 <= i < ctx["n"]):
@@ -2387,7 +2558,7 @@ class ProWindow(QMainWindow):
         ctx = self._corr_ctx
         if not ctx or ev.xdata is None or ev.ydata is None:
             return
-        if ev.inaxes is not ctx.get("ax"):
+        if not hit_axs(ev, [ctx.get("ax")]):
             return
         i, j = int(round(ev.ydata)), int(round(ev.xdata))
         n = len(ctx["names"])
@@ -2395,14 +2566,39 @@ class ProWindow(QMainWindow):
             return
         self._corr_pair = (i, j) if i < j else (j, i)
         self.draw_corr()
-        self.status.setText("%s vs %s · 近 %s 日相关 %.3f"
+        self._corr_focus_row()
+        self.status.setText("%s vs %s · 近 %s 日相关 %.3f · 已定位到左侧配对表"
                             % (ctx["names"][j], ctx["names"][i], ctx["days"],
                                ctx["m"][i, j]))
+
+    def _corr_focus_row(self):
+        """矩阵点完, 左侧配对表滚到同那一对并选中, 两边互相对得上。"""
+        ctx, pair = self._corr_ctx, self._corr_pair
+        if not ctx or not pair:
+            return
+        want = {ctx["codes"][pair[0]], ctx["codes"][pair[1]]}
+        t = self.corr_pairs
+        for r, (x, y) in enumerate(self._corr_show or []):
+            if {x, y} == want:
+                t.blockSignals(True)
+                t.selectRow(r)
+                t.blockSignals(False)
+                it = t.item(r, 0)
+                if it is not None:
+                    t.scrollToItem(it, QAbstractItemView.PositionAtCenter)
+                return
+        self.corr_pair_lbl.setText(
+            "已选 %s vs %s, 但当前%s里没列出这一对, 换「全部配对」或清掉搜索框"
+            % (short_name(ctx["names"][pair[0]], 8),
+               short_name(ctx["names"][pair[1]], 8),
+               self.corr_pair_mode.currentText()))
 
     def _corr_hover(self, ev):
         """鼠标停在哪一格, 状态栏就报那两只的名字与相关系数。"""
         ctx = self._corr_ctx
-        if not ctx or ev.inaxes is not ctx.get("ax") or ev.xdata is None or ev.ydata is None:
+        if not ctx or ev.xdata is None or ev.ydata is None:
+            return
+        if not hit_axs(ev, [ctx.get("ax")]):
             return
         i, j = int(round(ev.ydata)), int(round(ev.xdata))
         n = len(ctx["names"])
@@ -2596,11 +2792,13 @@ class ProWindow(QMainWindow):
             for idx in (i, j):
                 ax.axhline(idx + 0.5, color=ACCENT, lw=1.0, alpha=0.85, zorder=7)
                 ax.axvline(idx + 0.5, color=ACCENT, lw=1.0, alpha=0.85, zorder=7)
-        title = (f"日收益率相关性 · 近{days}日 · n={n} · 行序按相似度聚拢, 色块成团=同一风险源"
-                 if not pair else
-                 f"日收益率相关性 · 近{days}日 · n={n} · 已选: "
-                 f"{short_name(names2[pair[0]], 10)} vs {short_name(names2[pair[1]], 10)} "
-                 f"= {m2[pair[0], pair[1]]:.2f}")
+        if pair:
+            title = (f"日收益率相关性 · 近{days}日 · {n}×{n} 格 / {n*(n-1)//2} 对 · 已选: "
+                     f"{short_name(names2[pair[0]], 10)} vs {short_name(names2[pair[1]], 10)} "
+                     f"= {m2[pair[0], pair[1]]:.2f}")
+        else:
+            title = (f"日收益率相关性 · 近{days}日 · {n}×{n} 格 / {n*(n-1)//2} 对 · "
+                     f"行序按相似度聚拢, 色块成团=同一风险源")
         ax.set_title(title, loc="left", fontsize=10)
         cb = fig.colorbar(im, fraction=0.03, pad=0.02)
         cb.ax.tick_params(labelsize=7, colors=SUB)
@@ -2882,9 +3080,14 @@ class ProWindow(QMainWindow):
             for i, r in enumerate(rows):
                 if r["code"] == self._risk_sel:
                     t.selectRow(i)
+                    it = t.item(i, 0)
+                    # 点图上圆点时选中行常常在视野外, 不滚过去看着就像没反应
+                    if it is not None:
+                        t.scrollToItem(it, QAbstractItemView.PositionAtCenter)
                     break
+        else:
+            t.verticalScrollBar().setValue(pos)
         t.blockSignals(False)
-        t.verticalScrollBar().setValue(pos)
 
     # ---------------- 页5: 轮动 ----------------
     def draw_rot(self):

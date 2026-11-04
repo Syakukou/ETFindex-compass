@@ -32,7 +32,12 @@ def _qkey(q):
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-def cached(db_path, code):
+def cached(db_path, code, quarter=None):
+    """读库里的持仓明细。quarter 为空取最新一期, 指定则取该期。
+
+    一季报/三季报只披露前十大, 半年报/年报才是全量。想看上期中报的 100 只,
+    就把 quarter 指到那一期, 库里所有季度都存着。
+    """
     con = _conn(db_path)
     try:
         rows = con.execute(
@@ -47,8 +52,9 @@ def cached(db_path, code):
     for r in rows:
         if r[0] not in qs:
             qs.append(r[0])
-    q = qs[-1]
-    prev_q = qs[-2] if len(qs) > 1 else None
+    q = quarter if quarter in qs else qs[-1]
+    idx = qs.index(q)
+    prev_q = qs[idx - 1] if idx > 0 else None
     keep = [r for r in rows if r[0] == q]
     prev = {r[2]: (r[4] or 0) for r in rows if prev_q and r[0] == prev_q}
     prev_n = sum(1 for r in rows if prev_q and r[0] == prev_q)
@@ -61,7 +67,10 @@ def cached(db_path, code):
                         value=r[6], prev=p,
                         delta=(round((r[4] or 0) - p, 3) if p is not None else None),
                         new=(p is None and prev_q is not None)))
-    return dict(code=code, quarter=q, prev_quarter=prev_q, prev_rows=prev_n,
+    # 各期行数, 界面上直接标在季度下拉里: 季报 15 只 / 中报 100 只 一眼能看出来
+    cnt = {x: sum(1 for r in rows if r[0] == x) for x in qs}
+    return dict(code=code, quarter=q, quarters=qs, qcount=cnt,
+                prev_quarter=prev_q, prev_rows=prev_n,
                 fetched=keep[0][7], rows=out, top10=round(tot10, 2))
 
 
@@ -90,8 +99,15 @@ def cached_counts(db_path):
     return {c: v[1] for c, v in best.items()}
 
 
-def fetch(code, db_path, force=False, max_age_days=10):
-    """取最新季度重仓明细。force=False 且缓存新鲜则直接读库。"""
+def fetch(code, db_path, force=False, max_age_days=10, quarter=None):
+    """取重仓明细。force=False 且缓存新鲜则直接读库。
+
+    quarter 指定历史期时只读库: 已经披露过的期不会再变, 没必要重抓。
+    """
+    if quarter:
+        old = cached(db_path, code, quarter)
+        if old:
+            return old
     hit = cached(db_path, code)
     if hit and not force:
         try:
@@ -152,7 +168,7 @@ def fetch(code, db_path, force=False, max_age_days=10):
         con.commit()
     finally:
         con.close()
-    return cached(db_path, code) or dict(code=code, quarter=q, rows=[], top10=0.0)
+    return cached(db_path, code, quarter) or dict(code=code, quarter=q, rows=[], top10=0.0)
 
 
 def stock_quotes(codes, timeout=8):
