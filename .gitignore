@@ -1,0 +1,35 @@
+# ---- 桌面自用产物，不进仓库 ----
+start_*.bat
+*.exe
+*.db
+*.db-journal
+*.db-wal
+
+# ---- 虚拟环境 ----
+envs/
+venv/
+.venv/
+
+# ---- 打包产物（每次构建都有，几百 MB） ----
+build/
+build*/
+dist/
+dist*/
+*.spec.bak
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 本地临时 ----
+.libtv/
+*.log
+~$*

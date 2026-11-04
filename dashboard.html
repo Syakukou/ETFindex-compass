@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETF 跟踪面板</title>
+<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.1/echarts.min.js"></script>
+<script>
+  if (typeof echarts === "undefined") {
+    document.write('<script src="https://registry.npmmirror.com/echarts/5.5.1/files/dist/echarts.min.js"><\/script>');
+  }
+</script>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --line: #e5e8ee; --txt: #1f2733;
+    --sub: #6b7686; --up: #d93a3a; --down: #1a9e5c; --accent: #2f6fed;
+    --warn: #e67e22; --ok: #1a9e5c;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--txt);
+         font: 14px/1.5 "Microsoft YaHei", "PingFang SC", sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 14px 22px;
+           background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; }
+  header .meta { color: var(--sub); font-size: 12px; }
+  header .spacer { flex: 1; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+           padding: 8px 16px; cursor: pointer; font-size: 13px; }
+  button:disabled { opacity: .5; cursor: default; }
+  main { padding: 16px 22px; max-width: 1400px; margin: 0 auto; }
+
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .tab { padding: 6px 14px; border-radius: 16px; background: var(--panel);
+         border: 1px solid var(--line); cursor: pointer; font-size: 13px; }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(225px, 1fr));
+           gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 12px 14px; cursor: pointer; transition: box-shadow .15s; }
+  .card:hover { box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+  .card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,237,.15); }
+  .card .cat { font-size: 11px; color: var(--sub); }
+  .card .nm { font-size: 15px; font-weight: 600; margin: 2px 0; }
+  .card .px { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .card .row { display: flex; justify-content: space-between; margin-top: 6px;
+               font-size: 12px; color: var(--sub); }
+  .up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--sub); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+  .panel h2 { font-size: 15px; margin-bottom: 8px; }
+  .panel h2 small { font-size: 12px; color: var(--sub); font-weight: 400; }
+
+  /* 指标看板 */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+  .tile { background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+  .tile .k { font-size: 11px; color: var(--sub); }
+  .tile .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .s { font-size: 11px; color: var(--sub); }
+  .sec-title { font-size: 12px; color: var(--sub); margin: 12px 0 6px;
+               border-left: 3px solid var(--accent); padding-left: 8px; }
+  .sig { display: inline-block; padding: 3px 10px; border-radius: 12px;
+         font-size: 12px; margin: 2px 4px 2px 0; background: var(--bg); }
+  .sig.bull { background: #fdecec; color: var(--up); }
+  .sig.bear { background: #e8f6ee; color: var(--down); }
+  .sig.warn { background: #fdf1e3; color: var(--warn); }
+
+  /* 副图切换 */
+  .subbtns { display: flex; gap: 6px; margin-bottom: 6px; }
+  .subbtn { background: var(--bg); color: var(--txt); border: 1px solid var(--line);
+            padding: 4px 12px; border-radius: 14px; font-size: 12px; }
+  .subbtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #mainChart { width: 100%; height: 500px; }
+  #relChart, #flowChart { width: 100%; height: 300px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { padding: 6px 8px; text-align: left; color: var(--sub); cursor: pointer;
+       white-space: nowrap; user-select: none; }
+  th:hover { color: var(--accent); }
+  th .arr { font-size: 10px; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  tr[data-code] { cursor: pointer; }
+  tr[data-code]:hover { background: #f0f4fd; }
+  .empty { text-align: center; color: var(--sub); padding: 60px 0; }
+  #toast { position: fixed; right: 20px; bottom: 20px; background: #333c4d; color: #fff;
+           padding: 10px 18px; border-radius: 8px; display: none; font-size: 13px; z-index: 9; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ETF 跟踪面板</h1>
+  <span class="meta" id="statusMeta">加载中…</span>
+  <span class="spacer"></span>
+  <span class="meta">指标口径: 日K · RSI14 · KDJ(9,3,3) · BOLL(20,2) · MACD(12,26,9) · 不构成投资建议</span>
+  <button id="btnRefresh">刷新数据</button>
+</header>
+
+<main>
+  <div class="tabs" id="tabs"></div>
+  <div class="cards" id="cards"></div>
+
+  <div class="panel">
+    <h2 id="indTitle">指标看板</h2>
+    <div id="indBody"></div>
+  </div>
+
+  <div class="panel">
+    <h2>K 线与指标 <small>主图: 蜡烛 + MA5/20/60 + BOLL(20,2)</small></h2>
+    <div class="subbtns" id="subBtns"></div>
+    <div id="mainChart"></div>
+  </div>
+
+  <div class="panel">
+    <h2>相对走势对比 <small>当前分类内, 基期=100</small></h2>
+    <div id="relChart"></div>
+  </div>
+
+  <div class="panel">
+    <h2>多标的指标对比 <small>点击表头排序 · 点击行查看K线</small></h2>
+    <table id="cmpTbl"></table>
+  </div>
+
+  <div class="panel">
+    <h2>主力资金 <small>当日快照, 净流入排序</small></h2>
+    <div id="flowChart"></div>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const UP = "#d93a3a", DOWN = "#1a9e5c";
+const PALETTE = ["#2f6fed","#d93a3a","#1a9e5c","#f5a623","#9b59b6","#00b8d4","#e67e22","#7f8c9b","#c2185b","#5d4037"];
+let ETFs = [], KDATA = {};           // code -> kline array
+let curCat = "全部", curCode = null, subMode = "MACD";
+let sortKey = null, sortAsc = false;
+let mainChart, relChart, flowChart;
+
+const fmt = (v, d=2) => (v == null || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+const cls = v => v > 0 ? "up" : v < 0 ? "down" : "flat";
+const sign = (v, d=2) => v == null ? "—" : (v > 0 ? "+" : "") + fmt(v, d);
+const signPct = v => v == null ? "—" : (v > 0 ? "+" : "") + fmt(v) + "%";
+const pct = v => v == null ? "—" : fmt(v) + "%";
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  setTimeout(() => t.style.display = "none", 2500);
+}
+async function jget(url) { return (await fetch(url)).json(); }
+
+/* ================= 指标计算 ================= */
+function SMA(arr, n) {
+  const out = []; let sum = 0;
+  for (let i = 0; i < arr.length; i++) {
+    sum += arr[i];
+    if (i >= n) sum -= arr[i - n];
+    out.push(i >= n - 1 ? sum / n : null);
+  }
+  return out;
+}
+function EMA(arr, n) {
+  const out = [], a = 2 / (n + 1);
+  arr.forEach((v, i) => out.push(i === 0 ? v : a * v + (1 - a) * out[i - 1]));
+  return out;
+}
+function STDEV(arr, n, mids) {
+  const out = [];
+  for (let i = 0; i < arr.length; i++) {
+    if (mids[i] == null) { out.push(null); continue; }
+    const seg = arr.slice(i - n + 1, i + 1);
+    const m = mids[i];
+    out.push(Math.sqrt(seg.reduce((s, x) => s + (x - m) ** 2, 0) / n));
+  }
+  return out;
+}
+function RSI(close, n = 14) {
+  const out = [null];
+  let gAvg = 0, lAvg = 0;
+  for (let i = 1; i < close.length; i++) {
+    const ch = close[i] - close[i - 1];
+    const g = Math.max(ch, 0), l = Math.max(-ch, 0);
+    if (i <= n) {
+      gAvg = (gAvg * (i - 1) + g) / i; lAvg = (lAvg * (i - 1) + l) / i;
+      out.push(i === n ? 100 - 100 / (1 + gAvg / (lAvg || 1e-9)) : null);
+    } else {
+      gAvg = (gAvg * (n - 1) + g) / n; lAvg = (lAvg * (n - 1) + l) / n;
+      out.push(100 - 100 / (1 + gAvg / (lAvg || 1e-9)));
+    }
+  }
+  return out;
+}
+function KDJ(k, n = 9) {
+  const rsv = [], K = [50], D = [50], J = [50];
+  for (let i = 0; i < k.length; i++) {
+    const lo = Math.min(...k.slice(Math.max(0, i - n + 1), i + 1).map(x => x.low));
+    const hi = Math.max(...k.slice(Math.max(0, i - n + 1), i + 1).map(x => x.high));
+    rsv.push(hi === lo ? 50 : (k[i].close - lo) / (hi - lo) * 100);
+    if (i > 0) {
+      K.push(K[i - 1] * 2 / 3 + rsv[i] / 3);
+      D.push(D[i - 1] * 2 / 3 + K[i] / 3);
+      J.push(3 * K[i] - 2 * D[i]);
+    }
+  }
+  return { K, D, J };
+}
+function ATR(k, n = 14) {
+  const tr = k.map((x, i) => i === 0 ? x.high - x.low :
+    Math.max(x.high - x.low, Math.abs(x.high - k[i-1].close), Math.abs(x.low - k[i-1].close)));
+  return SMA(tr, n);
+}
+function CCI(k, n = 20) {
+  const tp = k.map(x => (x.high + x.low + x.close) / 3);
+  const ma = SMA(tp, n), out = [];
+  for (let i = 0; i < tp.length; i++) {
+    if (ma[i] == null) { out.push(null); continue; }
+    const seg = tp.slice(i - n + 1, i + 1);
+    const md = seg.reduce((s, x) => s + Math.abs(x - ma[i]), 0) / n;
+    out.push(md === 0 ? 0 : (tp[i] - ma[i]) / (0.015 * md));
+  }
+  return out;
+}
+function MACD(close) {
+  const dif = close.map((_, i) => EMA(close, 12)[i] - EMA(close, 26)[i]);
+  const dea = EMA(dif, 9);
+  return { dif, dea, hist: dif.map((v, i) => (v - dea[i]) * 2) };
+}
+function fullInd(k) {
+  const closes = k.map(x => x.close);
+  const n = closes.length;
+  const ret = i => n > i + 1 ? (closes[n-1] / closes[n-1-i] - 1) * 100 : null;
+  // 年化波动率 (近120日)
+  const rets = [];
+  for (let i = Math.max(1, n - 120); i < n; i++) rets.push(closes[i] / closes[i-1] - 1);
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const vol = Math.sqrt(rets.reduce((s, x) => s + (x - mean) ** 2, 0) / rets.length) * Math.sqrt(252) * 100;
+  // 最大回撤 (近250日)
+  const seg = closes.slice(Math.max(0, n - 250));
+  let peak = seg[0], mdd = 0;
+  seg.forEach(v => { peak = Math.max(peak, v); mdd = Math.min(mdd, v / peak - 1); });
+  // 52周位置
+  const y = closes.slice(Math.max(0, n - 244));
+  const hi = Math.max(...y), lo = Math.min(...y);
+  const YTD = (() => {
+    const d0 = k[n-1].date.slice(0, 4) + "-01-01";
+    const idx = k.findIndex(x => x.date >= d0);
+    return idx >= 0 && idx < n - 1 ? (closes[n-1] / closes[idx] - 1) * 100 : null;
+  })();
+  const ma5 = SMA(closes, 5), ma10 = SMA(closes, 10), ma20 = SMA(closes, 20), ma60 = SMA(closes, 60);
+  const bollMid = SMA(closes, 20), sd = STDEV(closes, 20, bollMid);
+  const bollUp = bollMid.map((m, i) => m == null ? null : m + 2 * sd[i]);
+  const bollLow = bollMid.map((m, i) => m == null ? null : m - 2 * sd[i]);
+  const pb = bollUp[n-1] == null ? null : (closes[n-1] - bollLow[n-1]) / (bollUp[n-1] - bollLow[n-1]) * 100;
+  const kdj = KDJ(k), macd = MACD(closes), rsi14 = RSI(closes), atr14 = ATR(k), cci20 = CCI(k);
+  const wr = (() => { // 威廉 %R 14
+    const hi14 = Math.max(...k.slice(-14).map(x => x.high));
+    const lo14 = Math.min(...k.slice(-14).map(x => x.low));
+    return (hi14 - closes[n-1]) / (hi14 - lo14 || 1e-9) * -100;
+  })();
+  const bias20 = ma20[n-1] ? (closes[n-1] / ma20[n-1] - 1) * 100 : null;
+  const bull = ma5[n-1] > ma10[n-1] && ma10[n-1] > ma20[n-1] && ma20[n-1] > ma60[n-1];
+  const bear = ma5[n-1] < ma10[n-1] && ma10[n-1] < ma20[n-1] && ma20[n-1] < ma60[n-1];
+  // MACD 3日内金叉/死叉
+  let macdSig = null;
+  for (let i = n - 3; i < n; i++) {
+    if (i > 0 && macd.dif[i-1] <= macd.dea[i-1] && macd.dif[i] > macd.dea[i]) macdSig = "金叉";
+    if (i > 0 && macd.dif[i-1] >= macd.dea[i-1] && macd.dif[i] < macd.dea[i]) macdSig = "死叉";
+  }
+  let kdjSig = null;
+  for (let i = n - 3; i < n; i++) {
+    if (i > 0 && kdj.K[i-1] <= kdj.D[i-1] && kdj.K[i] > kdj.D[i]) kdjSig = "金叉";
+    if (i > 0 && kdj.K[i-1] >= kdj.D[i-1] && kdj.K[i] < kdj.D[i]) kdjSig = "死叉";
+  }
+  return {
+    ma: { ma5, ma10, ma20, ma60 }, boll: { up: bollUp, mid: bollMid, low: bollLow },
+    macd, kdj, rsi14, atr14, cci20,
+    // 摘要
+    sum: {
+      rsi: rsi14[n-1], kdjK: kdj.K[n-1], kdjD: kdj.D[n-1], kdjJ: kdj.J[n-1],
+      dif: macd.dif[n-1], dea: macd.dea[n-1],
+      atr: atr14[n-1], atrPct: atr14[n-1] / closes[n-1] * 100,
+      cci: cci20[n-1], wr, pb, bias20, macdSig, kdjSig,
+      bull, bear,
+      r5: ret(5), r20: ret(20), r60: ret(60), r120: ret(120), ytd: YTD,
+      vol, mdd: mdd * 100,
+      hi52: hi, lo52: lo, pos52: (closes[n-1] - lo) / (hi - lo || 1e-9) * 100,
+      offHi: (closes[n-1] / hi - 1) * 100
+    }
+  };
+}
+
+/* ================= 渲染 ================= */
+function renderTabs() {
+  const cats = ["全部", ...new Set(ETFs.map(e => e.category))];
+  document.getElementById("tabs").innerHTML = cats.map(c =>
+    `<div class="tab ${c === curCat ? "active" : ""}" data-c="${c}">${c}
+      <span style="opacity:.6;font-size:11px">(${c === "全部" ? ETFs.length : ETFs.filter(e => e.category === c).length})</span></div>`).join("");
+  document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+    curCat = t.dataset.c; renderTabs(); renderCards(); renderRel(); renderCmp();
+  });
+}
+const shown = () => curCat === "全部" ? ETFs : ETFs.filter(e => e.category === curCat);
+
+function renderCards() {
+  document.getElementById("cards").innerHTML = shown().map(e => {
+    const s = e.snap;
+    if (!s) return `<div class="card" data-code="${e.code}">
+      <div class="cat">${e.category}</div><div class="nm">${e.name}</div>
+      <div class="px flat">暂无快照</div>
+      <div class="row"><span>${e.code}</span><span>K线 ${KDATA[e.code]?.length || 0} 天</span></div></div>`;
+    const c = cls(s.pct_chg), ind = KDATA[e.code] ? fullInd(KDATA[e.code]).sum : null;
+    return `<div class="card ${e.code === curCode ? "sel" : ""}" data-code="${e.code}">
+      <div class="cat">${e.category} · ${e.note || ""}</div>
+      <div class="nm">${e.name}</div>
+      <div class="px ${c}">${fmt(s.close, 3)} <span style="font-size:13px">${signPct(s.pct_chg)}</span></div>
+      <div class="row"><span>溢价 ${sign(s.premium)}%</span>
+        <span>主力 ${s.main_in > 0 ? "+" : ""}${fmt(s.main_in, 0)}万</span></div>
+      <div class="row"><span>RSI ${ind ? fmt(ind.rsi, 0) : "—"}</span>
+        <span>20日 ${ind ? signPct(ind.r20) : "—"}</span>
+        <span class="${ind ? cls(ind.ytd) : ""}">年内 ${ind ? signPct(ind.ytd) : "—"}</span></div>
+    </div>`;
+  }).join("");
+  document.querySelectorAll(".card").forEach(el => el.onclick = () => selectCode(el.dataset.code));
+}
+
+/* ---- 指标看板 ---- */
+function tile(k, v, s, vc) {
+  return `<div class="tile"><div class="k">${k}</div>
+    <div class="v ${vc || ""}">${v}</div><div class="s">${s || ""}</div></div>`;
+}
+function renderIndicators() {
+  const box = document.getElementById("indBody");
+  const e = ETFs.find(x => x.code === curCode), k = KDATA[curCode];
+  if (!e) { box.innerHTML = `<div class="empty">请选择标的</div>`; return; }
+  document.getElementById("indTitle").innerHTML =
+    `指标看板 <small>${e.name} (${e.code}) · ${e.category}</small>`;
+  if (!k || k.length < 30) { box.innerHTML = `<div class="empty">K线数据不足, 点击右上角刷新</div>`; return; }
+  const s = e.snap || {}, d = fullInd(k).sum;
+  const sigs = [];
+  if (d.bull) sigs.push(`<span class="sig bull">均线多头排列</span>`);
+  if (d.bear) sigs.push(`<span class="sig bear">均线空头排列</span>`);
+  if (d.macdSig === "金叉") sigs.push(`<span class="sig bull">MACD金叉(3日内)</span>`);
+  if (d.macdSig === "死叉") sigs.push(`<span class="sig bear">MACD死叉(3日内)</span>`);
+  if (d.kdjSig === "金叉") sigs.push(`<span class="sig bull">KDJ金叉(3日内)</span>`);
+  if (d.kdjSig === "死叉") sigs.push(`<span class="sig bear">KDJ死叉(3日内)</span>`);
+  if (d.rsi != null && d.rsi > 70) sigs.push(`<span class="sig warn">RSI超买</span>`);
+  if (d.rsi != null && d.rsi < 30) sigs.push(`<span class="sig warn">RSI超卖</span>`);
+  if (d.wr != null && d.wr > -20) sigs.push(`<span class="sig warn">威廉超买</span>`);
+  if (d.wr != null && d.wr < -80) sigs.push(`<span class="sig warn">威廉超卖</span>`);
+  if (d.pb != null && d.pb > 100) sigs.push(`<span class="sig warn">突破布林上轨</span>`);
+  if (d.pb != null && d.pb < 0) sigs.push(`<span class="sig warn">跌破布林下轨</span>`);
+  if (!sigs.length) sigs.push(`<span class="sig">无显著信号</span>`);
+
+  box.innerHTML = `
+    <div class="sec-title">行情快照 (日频)</div>
+    <div class="tiles">
+      ${tile("最新价", fmt(s.close, 3), signPct(s.pct_chg), cls(s.pct_chg))}
+      ${tile("IOPV / 溢价率", fmt(s.iopv, 3), sign(s.premium) + "%", cls(s.premium))}
+      ${tile("主力净流入", (s.main_in > 0 ? "+" : "") + fmt(s.main_in / 10000, 2) + "亿", "当日", cls(s.main_in))}
+      ${tile("成交额", fmt(s.amount / 10000, 2) + "亿", "换手 " + fmt(s.turnover) + "% · 量比 " + fmt(s.vol_ratio))}
+      ${tile("最新份额", fmt(s.shares, 1) + "亿份", "较前日变动看数据库")}
+    </div>
+    <div class="sec-title">技术指标</div>
+    <div class="tiles">
+      ${tile("RSI(14)", fmt(d.rsi, 1), d.rsi > 70 ? "超买" : d.rsi < 30 ? "超卖" : "中性",
+             d.rsi > 70 ? "up" : d.rsi < 30 ? "down" : "")}
+      ${tile("KDJ K/D/J", `${fmt(d.kdjK,0)}/${fmt(d.kdjD,0)}/${fmt(d.kdjJ,0)}`,
+             "J>100超买 J<0超卖", d.kdjJ > 100 ? "up" : d.kdjJ < 0 ? "down" : "")}
+      ${tile("MACD DIF/DEA", `${sign(d.dif, 3)}/${sign(d.dea, 3)}`,
+             d.dif > d.dea ? "多头 (DIF>DEA)" : "空头 (DIF<DEA)", d.dif > d.dea ? "up" : "down")}
+      ${tile("布林 %B", fmt(d.pb, 1) + "%", "0=下轨 100=上轨")}
+      ${tile("CCI(20)", fmt(d.cci, 0), d.cci > 100 ? "强势" : d.cci < -100 ? "弱势" : "中性")}
+      ${tile("威廉 %R(14)", fmt(d.wr, 1), "超买>-20 超卖<-80")}
+      ${tile("乖离率 BIAS(20)", sign(d.bias20) + "%", "收盘偏离MA20", cls(d.bias20))}
+      ${tile("ATR(14)", fmt(d.atr, 3), "真实波幅 " + fmt(d.atrPct) + "%")}
+    </div>
+    <div class="sec-title">收益与风险</div>
+    <div class="tiles">
+      ${tile("近5日", signPct(d.r5), "", cls(d.r5))}
+      ${tile("近20日", signPct(d.r20), "", cls(d.r20))}
+      ${tile("近60日", signPct(d.r60), "", cls(d.r60))}
+      ${tile("近120日", signPct(d.r120), "", cls(d.r120))}
+      ${tile("年初至今", signPct(d.ytd), "", cls(d.ytd))}
+      ${tile("年化波动率", fmt(d.vol, 1) + "%", "近120日")}
+      ${tile("最大回撤", fmt(d.mdd, 1) + "%", "近250日", "down")}
+      ${tile("52周位置", fmt(d.pos52, 0) + "%", `距高点 ${fmt(d.offHi)}% · 高 ${fmt(d.hi52,3)} / 低 ${fmt(d.lo52,3)}`)}
+    </div>
+    <div class="sec-title">信号</div>
+    <div>${sigs.join("")}</div>`;
+}
+
+/* ---- K线主图 ---- */
+function renderSubBtns() {
+  document.getElementById("subBtns").innerHTML = ["MACD", "RSI", "KDJ"].map(m =>
+    `<div class="subbtn ${m === subMode ? "active" : ""}" data-m="${m}">${m}</div>`).join("");
+  document.querySelectorAll(".subbtn").forEach(b => b.onclick = () => {
+    subMode = b.dataset.m; renderSubBtns(); drawMain();
+  });
+}
+function drawMain() {
+  const k = KDATA[curCode] || [];
+  const e = ETFs.find(x => x.code === curCode);
+  if (!k.length) {
+    mainChart.clear();
+    mainChart.setOption({ title: { text: "暂无K线数据, 点击右上角刷新", left: "center", top: "middle",
+      textStyle: { color: "#6b7686", fontSize: 14 } } });
+    return;
+  }
+  const dates = k.map(x => x.date), closes = k.map(x => x.close);
+  const kdata = k.map(x => [x.open, x.close, x.low, x.high]);
+  const ind = fullInd(k);
+  const ma5 = ind.ma.ma5, ma20 = ind.ma.ma20, ma60 = ind.ma.ma60;
+  const vols = k.map(x => x.volume);
+  const vc = k.map((x, i) => x.close >= x.open ? UP : DOWN);
+  let subSeries = [], subMax = null, subMin = null;
+  if (subMode === "MACD") {
+    subSeries = [
+      { name: "MACD柱", type: "bar", data: ind.macd.hist, xAxisIndex: 2, yAxisIndex: 2,
+        itemStyle: { color: p => p.value >= 0 ? UP : DOWN } },
+      { name: "DIF", type: "line", data: ind.macd.dif, xAxisIndex: 2, yAxisIndex: 2,
+        showSymbol: false, lineStyle: { width: 1, color: "#f5a623" } },
+      { name: "DEA", type: "line", data: ind.macd.dea, xAxisIndex: 2, yAxisIndex: 2,
+        showSymbol: false, lineStyle: { width: 1, color: "#2f6fed" } }];
+  } else if (subMode === "RSI") {
+    subSeries = [{ name: "RSI14", type: "line", data: ind.rsi14, xAxisIndex: 2, yAxisIndex: 2,
+      showSymbol: false, lineStyle: { width: 1.2, color: "#9b59b6" },
+      markLine: { silent: true, symbol: "none", label: { fontSize: 10 },
+        data: [{ yAxis: 70, lineStyle: { color: UP, type: "dashed" } },
+               { yAxis: 30, lineStyle: { color: DOWN, type: "dashed" } }] } }];
+  } else {
+    subSeries = [
+      { name: "K", type: "line", data: ind.kdj.K, xAxisIndex: 2, yAxisIndex: 2,
+        showSymbol: false, lineStyle: { width: 1, color: "#f5a623" } },
+      { name: "D", type: "line", data: ind.kdj.D, xAxisIndex: 2, yAxisIndex: 2,
+        showSymbol: false, lineStyle: { width: 1, color: "#2f6fed" } },
+      { name: "J", type: "line", data: ind.kdj.J, xAxisIndex: 2, yAxisIndex: 2,
+        showSymbol: false, lineStyle: { width: 1, color: "#9b59b6" } }];
+  }
+  mainChart.clear();
+  mainChart.setOption({
+    animation: false,
+    axisPointer: { link: [{ xAxisIndex: "all" }] },
+    tooltip: { trigger: "axis", backgroundColor: "#fff", borderColor: "#e5e8ee",
+      textStyle: { color: "#1f2733", fontSize: 12 } },
+    legend: { top: 0, textStyle: { fontSize: 11, color: "#6b7686" },
+      data: ["MA5", "MA20", "MA60"] },
+    grid: [{ left: 60, right: 20, top: 30, height: "44%" },
+           { left: 60, right: 20, top: "59%", height: "11%" },
+           { left: 60, right: 20, top: "76%", height: "14%" }],
+    xAxis: [0, 1, 2].map(i => ({
+      type: "category", data: dates, gridIndex: i,
+      axisLine: { lineStyle: { color: "#c8cfd9" } },
+      axisLabel: { show: i === 2, fontSize: 11, color: "#6b7686" },
+      axisTick: { show: false } })),
+    yAxis: [
+      { scale: true, gridIndex: 0, splitLine: { lineStyle: { color: "#eef1f5" } },
+        axisLabel: { fontSize: 11, color: "#6b7686" } },
+      { gridIndex: 1, splitLine: { show: false }, axisLabel: { show: false } },
+      { scale: subMode !== "MACD", gridIndex: 2, splitLine: { show: false },
+        axisLabel: { fontSize: 10, color: "#6b7686" } }],
+    dataZoom: [{ type: "inside", xAxisIndex: [0, 1, 2],
+                 start: Math.max(0, 100 - 120 / k.length * 100), end: 100 },
+      { type: "slider", xAxisIndex: [0, 1, 2], bottom: 4, height: 16 }],
+    series: [
+      { name: "K线", type: "candlestick", data: kdata, xAxisIndex: 0, yAxisIndex: 0,
+        itemStyle: { color: UP, color0: DOWN, borderColor: UP, borderColor0: DOWN } },
+      { name: "MA5", type: "line", data: ma5, xAxisIndex: 0, yAxisIndex: 0,
+        showSymbol: false, lineStyle: { width: 1, color: "#f5a623" } },
+      { name: "MA20", type: "line", data: ma20, xAxisIndex: 0, yAxisIndex: 0,
+        showSymbol: false, lineStyle: { width: 1, color: "#2f6fed" } },
+      { name: "MA60", type: "line", data: ma60, xAxisIndex: 0, yAxisIndex: 0,
+        showSymbol: false, lineStyle: { width: 1, color: "#9b59b6" } },
+      { name: "BOLL上", type: "line", data: ind.boll.up, xAxisIndex: 0, yAxisIndex: 0,
+        showSymbol: false, lineStyle: { width: 1, color: "#b0b8c4", type: "dashed" } },
+      { name: "BOLL下", type: "line", data: ind.boll.low, xAxisIndex: 0, yAxisIndex: 0,
+        showSymbol: false, lineStyle: { width: 1, color: "#b0b8c4", type: "dashed" },
+        areaStyle: { color: "rgba(176,184,196,.08)" } },
+      { name: "成交量", type: "bar", data: vols, xAxisIndex: 1, yAxisIndex: 1,
+        itemStyle: { color: p => vc[p.dataIndex] } },
+      ...subSeries]
+  });
+}
+
+/* ---- 相对走势 ---- */
+async function renderRel() {
+  const list = shown().filter(e => KDATA[e.code]?.length > 20);
+  if (!list.length) { relChart.clear(); return; }
+  // 对齐: 各自取末段, 以各自起点归一(近似对齐, 末日对齐归一更严谨)
+  const N = Math.min(...list.map(e => KDATA[e.code].length), 250);
+  const base = list.map(e => { const k = KDATA[e.code]; return k[k.length - N].close; });
+  const dates = KDATA[list[0].code].slice(-N).map(x => x.date);
+  const series = list.map((e, i) => ({
+    name: e.name, type: "line", showSymbol: false,
+    data: KDATA[e.code].slice(-N).map(x => +(x.close / base[i] * 100).toFixed(2)),
+    lineStyle: { width: 1.5, color: PALETTE[i % PALETTE.length] },
+    itemStyle: { color: PALETTE[i % PALETTE.length] },
+    endLabel: { show: true, fontSize: 11, color: PALETTE[i % PALETTE.length],
+      formatter: p => (p.value - 100 > 0 ? "+" : "") + (p.value - 100).toFixed(1) + "%" }
+  }));
+  relChart.clear();
+  relChart.setOption({
+    animation: false,
+    tooltip: { trigger: "axis", textStyle: { fontSize: 12 },
+      valueFormatter: v => (v - 100 > 0 ? "+" : "") + (v - 100).toFixed(2) + "%" },
+    legend: { top: 0, type: "scroll", textStyle: { fontSize: 11, color: "#6b7686" } },
+    grid: { left: 50, right: 70, top: 30, bottom: 50 },
+    xAxis: { type: "category", data: dates,
+      axisLabel: { fontSize: 11, color: "#6b7686" },
+      axisLine: { lineStyle: { color: "#c8cfd9" } } },
+    yAxis: { scale: true, axisLabel: { fontSize: 11, color: "#6b7686" },
+      splitLine: { lineStyle: { color: "#eef1f5" } } },
+    dataZoom: [{ type: "inside" }],
+    series });
+}
+
+/* ---- 对比表 ---- */
+function renderCmp() {
+  const cols = [
+    { k: "name", t: "名称" }, { k: "cat", t: "分类" },
+    { k: "close", t: "最新价" }, { k: "pct", t: "涨跌%" }, { k: "premium", t: "溢价%" },
+    { k: "main_in", t: "主力(万)" }, { k: "rsi", t: "RSI14" }, { k: "kdjJ", t: "KDJ-J" },
+    { k: "macdSt", t: "MACD" }, { k: "pb", t: "布林%B" }, { k: "r5", t: "5日%" },
+    { k: "r20", t: "20日%" }, { k: "ytd", t: "年内%" }, { k: "vol", t: "年化波动%" },
+    { k: "mdd", t: "最大回撤%" }, { k: "pos52", t: "52周位置%" }];
+  const rows = shown().map(e => {
+    const s = e.snap || {};
+    const d = KDATA[e.code] ? fullInd(KDATA[e.code]).sum : null;
+    return { code: e.code, name: e.name, cat: e.category,
+      close: s.close, pct: s.pct_chg, premium: s.premium, main_in: s.main_in,
+      rsi: d?.rsi, kdjJ: d?.kdjJ, macdSt: d ? (d.dif > d.dea ? "多头" : "空头") : null,
+      pb: d?.pb, r5: d?.r5, r20: d?.r20, ytd: d?.ytd, vol: d?.vol, mdd: d?.mdd,
+      pos52: d?.pos52 };
+  });
+  if (sortKey) rows.sort((a, b) => {
+    const va = a[sortKey], vb = b[sortKey];
+    return (va == null ? -1e18 : va) < (vb == null ? -1e18 : vb) ? (sortAsc ? -1 : 1)
+         : (va == null ? -1e18 : va) > (vb == null ? -1e18 : vb) ? (sortAsc ? 1 : -1) : 0;
+  });
+  const cell = (v, c) => `<td class="${c || ""}">${v ?? "—"}</td>`;
+  document.getElementById("cmpTbl").innerHTML =
+    `<tr>${cols.map(c => `<th data-k="${c.k}">${c.t}
+        ${sortKey === c.k ? `<span class="arr">${sortAsc ? "▲" : "▼"}</span>` : ""}</th>`).join("")}</tr>` +
+    rows.map(r => `<tr data-code="${r.code}">
+      ${cell(r.name)}${cell(r.cat)}
+      ${cell(fmt(r.close, 3), cls(r.pct))}${cell(signPct(r.pct), cls(r.pct))}
+      ${cell(sign(r.premium), cls(r.premium))}
+      ${cell(r.main_in == null ? null : (r.main_in > 0 ? "+" : "") + fmt(r.main_in, 0), cls(r.main_in))}
+      ${cell(fmt(r.rsi, 1), r.rsi > 70 ? "up" : r.rsi < 30 ? "down" : "")}
+      ${cell(fmt(r.kdjJ, 1), r.kdjJ > 100 ? "up" : r.kdjJ < 0 ? "down" : "")}
+      ${cell(r.macdSt, r.macdSt === "多头" ? "up" : r.macdSt === "空头" ? "down" : "")}
+      ${cell(fmt(r.pb, 1))}
+      ${cell(signPct(r.r5), cls(r.r5))}${cell(signPct(r.r20), cls(r.r20))}
+      ${cell(signPct(r.ytd), cls(r.ytd))}
+      ${cell(fmt(r.vol, 1))}${cell(fmt(r.mdd, 1), "down")}
+      ${cell(fmt(r.pos52, 0))}</tr>`).join("");
+  document.querySelectorAll("#cmpTbl th").forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    if (sortKey === k) sortAsc = !sortAsc; else { sortKey = k; sortAsc = false; }
+    renderCmp();
+  });
+  document.querySelectorAll("#cmpTbl tr[data-code]").forEach(r =>
+    r.onclick = () => selectCode(r.dataset.code));
+}
+
+/* ---- 资金流 ---- */
+function drawFlow() {
+  const list = ETFs.filter(e => e.snap && e.snap.main_in != null)
+    .sort((a, b) => a.snap.main_in - b.snap.main_in);
+  if (!list.length) { flowChart.clear(); return; }
+  flowChart.clear();
+  flowChart.setOption({
+    animation: false,
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, textStyle: { fontSize: 12 } },
+    grid: { left: 110, right: 60, top: 10, bottom: 30 },
+    xAxis: { type: "value", axisLabel: { fontSize: 11, color: "#6b7686",
+      formatter: v => v / 10000 + "亿" },
+      splitLine: { lineStyle: { color: "#eef1f5" } } },
+    yAxis: { type: "category", data: list.map(e => e.name),
+      axisLabel: { fontSize: 12 }, axisTick: { show: false },
+      axisLine: { lineStyle: { color: "#c8cfd9" } } },
+    series: [{ type: "bar", barWidth: 14,
+      data: list.map(e => ({ value: e.snap.main_in,
+        itemStyle: { color: e.snap.main_in >= 0 ? UP : DOWN } })),
+      label: { show: true, position: "right", fontSize: 11, color: "#6b7686",
+        formatter: p => (p.value > 0 ? "+" : "") + (p.value / 10000).toFixed(2) + "亿" } }]
+  });
+}
+
+/* ================= 数据流 ================= */
+async function selectCode(code) {
+  curCode = code;
+  renderCards(); renderIndicators(); renderCmp();
+  if (!KDATA[code]) KDATA[code] = await jget("/api/kline?code=" + code);
+  drawMain();
+}
+async function loadAll() {
+  ETFs = await jget("/api/etfs");
+  // 预取当前分类全部K线(供对比图/表)
+  const need = shown().filter(e => !KDATA[e.code]).map(e => e.code);
+  await Promise.all(need.map(async c => KDATA[c] = await jget("/api/kline?code=" + c)));
+  renderTabs(); renderCards(); renderIndicators(); renderRel(); renderCmp(); drawFlow();
+  await loadStatus();
+  if (!curCode && ETFs.length) selectCode(ETFs[0].code);
+  else if (curCode) drawMain();
+}
+async function loadStatus() {
+  const st = await jget("/api/status");
+  document.getElementById("statusMeta").textContent =
+    `数据日期 ${st.trade_date || "—"} · 更新于 ${st.fetched_at || "—"} · K线覆盖 ${st.kline_codes} 只`;
+}
+document.getElementById("btnRefresh").onclick = async function () {
+  this.disabled = true; this.textContent = "刷新中…";
+  try {
+    await jget("/api/refresh");
+    toast("已触发刷新, 后台拉取行情与日K(11只约30秒), 稍后自动更新");
+    setTimeout(loadAll, 30000);
+    setTimeout(() => { this.disabled = false; this.textContent = "刷新数据"; }, 45000);
+  } catch (e) {
+    toast("刷新失败: " + e.message);
+    this.disabled = false; this.textContent = "刷新数据";
+  }
+};
+
+window.addEventListener("resize", () => { mainChart.resize(); relChart.resize(); flowChart.resize(); });
+mainChart = echarts.init(document.getElementById("mainChart"));
+relChart = echarts.init(document.getElementById("relChart"));
+flowChart = echarts.init(document.getElementById("flowChart"));
+renderSubBtns();
+loadAll();
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

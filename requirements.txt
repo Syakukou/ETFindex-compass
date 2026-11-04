@@ -1,0 +1,9 @@
+# ETF 量化分析终端 运行依赖
+PySide6>=6.6.0
+matplotlib>=3.7.0
+numpy>=1.24.0
+pandas>=2.0.0
+akshare>=1.12.0
+
+# 可选：仅 etf_tracker.py 的 Tushare 备份通道需要
+# tushare>=1.2.89

@@ -1,0 +1,3094 @@
+# -*- coding: utf-8 -*-
+"""
+ETF 量化分析终端 (PySide6 专业桌面软件, 暗色终端风格)
+- 六页签: 评分排名 / K线图表 / 相关性矩阵 / 风险收益 / 板块轮动 / 进场时点
+- 进场时点: 宽基指数 x ETF资金 x 股指期货基差持仓 x 期权PCR隐波, 四维对账
+- 分析引擎: etf_analytics.py (四因子评分/相关性/轮动/每日结论)
+- 数据: 复用 etf_app.py 的 SQLite 与刷新逻辑
+"""
+import sys
+import threading
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("QtAgg")
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
+
+from PySide6.QtCore import Qt, QTimer, Signal, QThread
+from PySide6.QtGui import QColor, QFont, QAction
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QPushButton, QComboBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView, QTextEdit, QSplitter, QGroupBox, QStatusBar,
+    QToolBar, QSizePolicy, QListWidget, QListWidgetItem, QLineEdit, QCheckBox, QDialog)
+
+BASE = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE))
+from etf_analytics import Analyzer  # noqa: E402
+from etf_meta import looks_qdii  # noqa: E402
+import etf_app  # noqa: E402
+from etf_app import refresh_data    # noqa: E402
+import etf_flow  # noqa: E402
+import etf_hold  # noqa: E402
+import etf_inst  # noqa: E402
+
+# 暗色终端配色
+BG = "#161a23"; PANEL = "#1e222d"; PANEL2 = "#232834"
+TXT = "#d1d4dc"; SUB = "#787b86"; UP = "#e05252"; DOWN = "#3fb68b"
+ACCENT = "#4a8cff"; GRID = "#2a2e39"; WARN = "#e6a23c"
+
+matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+DARK_RC = {
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL,
+    "axes.edgecolor": GRID, "axes.labelcolor": TXT,
+    "xtick.color": SUB, "ytick.color": SUB,
+    "grid.color": GRID, "text.color": TXT,
+    "axes.titlesize": 11, "xtick.labelsize": 8, "ytick.labelsize": 8,
+}
+plt.rcParams.update(DARK_RC)
+
+QSS = f"""
+QMainWindow, QWidget {{ background: {BG}; color: {TXT}; font-size: 12px; }}
+QTabWidget::pane {{ border: 1px solid {GRID}; background: {PANEL}; }}
+QTabBar::tab {{ background: {PANEL2}; color: {SUB}; padding: 8px 18px;
+    border: 1px solid {GRID}; border-bottom: none; }}
+QTabBar::tab:selected {{ color: {TXT}; background: {PANEL};
+    border-top: 2px solid {ACCENT}; }}
+QTableWidget {{ background: {PANEL}; gridline-color: {GRID}; color: {TXT};
+    border: 1px solid {GRID}; }}
+QHeaderView::section {{ background: {PANEL2}; color: {SUB};
+    border: 1px solid {GRID}; padding: 5px; font-weight: bold; }}
+QTableWidget::item:selected {{ background: {ACCENT}; color: white; }}
+QPushButton {{ background: {ACCENT}; color: white; border: none;
+    padding: 6px 16px; border-radius: 4px; }}
+QPushButton:disabled {{ background: {GRID}; color: {SUB}; }}
+QComboBox {{ background: {PANEL2}; color: {TXT}; border: 1px solid {GRID};
+    padding: 4px 8px; border-radius: 3px; }}
+QTextEdit {{ background: {PANEL}; border: 1px solid {GRID};
+    font-family: "Microsoft YaHei"; font-size: 13px; padding: 8px; }}
+QStatusBar {{ background: {PANEL2}; color: {SUB}; }}
+QToolBar {{ background: {PANEL2}; border-bottom: 1px solid {GRID}; spacing: 8px; }}
+QLabel#title {{ font-size: 15px; font-weight: bold; color: {TXT}; }}
+QLabel#meta {{ color: {SUB}; font-size: 11px; }}
+QGroupBox {{ border: 1px solid {GRID}; border-radius: 5px; margin-top: 10px;
+    color: {SUB}; font-weight: bold; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}
+"""
+
+
+def color_item(text, v, fmt="{:+.2f}", colorize=True):
+    it = QTableWidgetItem(text)
+    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    if colorize and v is not None:
+        it.setForeground(QColor(UP if v > 0 else DOWN if v < 0 else SUB))
+    return it
+
+
+def color_of(v):
+    """数值 -> 涨跌色, 空值取次级灰"""
+    if v is None:
+        return QColor(SUB)
+    return QColor(UP if v > 0 else DOWN if v < 0 else SUB)
+
+
+def n0(v, d=2):
+    return "—" if v is None else format(v, ".%df" % d)
+
+
+def short_name(n, k=8):
+    """图轴/窄表用的短名: 去掉 ETF 后缀, 过长截断"""
+    s = str(n).replace("ETF", "").replace("指数", "")
+    return s if len(s) <= k else s[:k - 1] + "…"
+
+
+def _ffill(vals):
+    """按日期对齐后补空值: 跨境指数比 A 股少一个交易日, 缺的那天沿用前收。
+
+    开头若还缺(标的上市晚于窗口), 用第一个有效值回填, 避免前段断线。
+    """
+    out = list(vals)
+    last = None
+    for i, v in enumerate(out):
+        if v is None:
+            out[i] = last
+        else:
+            last = v
+    first = next((v for v in out if v is not None), None)
+    for i in range(len(out)):
+        if out[i] is None:
+            out[i] = first
+    return out
+
+
+class RefreshThread(QThread):
+    done = Signal(int, list)
+
+    def run(self):
+        try:
+            ok, errs = refresh_data()
+        except Exception as e:
+            ok, errs = 0, [str(e)]
+        self.done.emit(ok, errs)
+
+
+class FlowThread(QThread):
+    """四维数据取数线程: 指数日线 + 期货 + 期权, 合计约 6 秒"""
+    done = Signal(dict)
+
+    def __init__(self, scores, db):
+        super().__init__()
+        self.scores = scores
+        self.db = db
+
+    def run(self):
+        try:
+            import etf_flow
+            d = etf_flow.snapshot(self.scores, self.db)
+        except Exception as e:
+            d = {"rows": [], "err": ["%s: %s" % (type(e).__name__, e)]}
+        self.done.emit(d)
+
+
+class HoldBatchThread(QThread):
+    """批量取季报持仓: 逐只拉, 拉过的 fetch 会直接命中缓存。"""
+    tick = Signal(int, int, str, int)
+    finished_all = Signal(int, int)
+
+    def __init__(self, codes, db):
+        super().__init__()
+        self.codes = list(codes)
+        self.db = db
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        ok = fail = 0
+        for i, code in enumerate(self.codes):
+            if self._stop:
+                break
+            try:
+                h = etf_hold.fetch(code, self.db)
+                n = len(h.get("rows") or [])
+            except Exception:
+                n = -1
+            if n > 0:
+                ok += 1
+            elif n == 0:
+                fail += 1
+            self.tick.emit(i + 1, len(self.codes), code, n)
+            self.msleep(120)
+        self.finished_all.emit(ok, fail)
+
+
+class InstThread(QThread):
+    """拉季度机构持仓(社保/QFII/保险/券商/信托/基金) + 陆股通持股。"""
+    tick = Signal(str)
+    done = Signal(int, int, list)
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+
+    def run(self):
+        errs = []
+        n1 = n2 = 0
+        try:
+            q = etf_inst.quarters(1)[0]
+        except Exception as e:
+            self.done.emit(0, 0, ["%s: %s" % (type(e).__name__, e)])
+            return
+        try:
+            self.tick.emit("拉机构持仓 %s…" % q)
+            n1, e1 = etf_inst.refresh_inst(self.db, q, force=True)
+            errs += e1
+            self.tick.emit("机构 %d 行, 拉陆股通…" % n1)
+            n2 = etf_inst.refresh_hsgt(self.db, q, force=True)
+            self.tick.emit("陆股通 %d 只" % n2)
+        except Exception as e:
+            errs.append("%s: %s" % (type(e).__name__, e))
+        self.done.emit(n1, n2, errs)
+
+
+class ChartWidget(QWidget):
+    """matplotlib 画布 + 工具栏封装"""
+    def __init__(self, figsize=(9, 6), toolbar=True):
+        super().__init__()
+        self.fig = Figure(figsize=figsize, dpi=96)
+        self.fig.patch.set_facecolor(PANEL)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 0)
+        lay.setSpacing(0)
+        if toolbar:
+            self.toolbar = NavigationToolbar2QT(self.canvas, self)
+            lay.addWidget(self.toolbar)
+        lay.addWidget(self.canvas)
+
+    def clear(self):
+        self.fig.clear()
+
+    def draw(self):
+        self.canvas.draw_idle()
+
+
+class ProWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ETF 量化分析终端")
+        self.resize(1460, 980)
+        self.analyzer = None
+        self.refreshing = False
+        self._sort_key = "score"
+        self._sort_desc = True
+        self._view_rows = []
+        self._sort_def = {}
+        self._hdr_base = []
+        self._build()
+        self._load()
+
+    # ---------------- UI 构建 ----------------
+    def _build(self):
+        tb = QToolBar()
+        self.addToolBar(tb)
+        self.btn_refresh = QPushButton(" 刷新数据 ")
+        self.btn_refresh.clicked.connect(self.on_refresh)
+        tb.addWidget(self.btn_refresh)
+        self.meta_lbl = QLabel(" 加载中… ")
+        self.meta_lbl.setObjectName("meta")
+        tb.addWidget(self.meta_lbl)
+        tb.addWidget(QLabel("    口径: 日K · 评分=动量40%+趋势30%+资金20%+风险10% · 不构成投资建议 "))
+
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        self._tab_overview()
+        self._tab_kline()
+        self._tab_corr()
+        self._tab_risk()
+        self._tab_rot()
+        self._tab_index()
+        self._tab_hold()
+        # 成分股表第一次显示时按真实窗口宽度压一次列宽(渲染时窗口可能还没成型)
+        self._hold_tab_idx = self.tabs.count() - 1
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        sb = QStatusBar()
+        self.setStatusBar(sb)
+        self.status = QLabel("就绪")
+        sb.addWidget(self.status)
+
+    def _tab_overview(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        # 顶部: 每日结论
+        self.brief_box = QTextEdit()
+        self.brief_box.setReadOnly(True)
+        self.brief_box.setMaximumHeight(142)
+        lay.addWidget(QLabel("每日分析结论"))
+        lay.addWidget(self.brief_box)
+        # 过滤条
+        frow = QHBoxLayout()
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("过滤: 输入代码 / 名称 / 分类, 如 科创、588、黄金")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.textChanged.connect(lambda _: self.render_scores())
+        frow.addWidget(self.filter_edit, 1)
+        self.jump_chk = QCheckBox("点名称跳K线")
+        self.jump_chk.setChecked(True)
+        self.jump_chk.setToolTip("只有点「名称」格才跳到 K线图; 点其它数字列只做左侧联动, 不切页。\n"
+                                 "双击任意一格始终跳转。")
+        frow.addWidget(self.jump_chk)
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("meta")
+        frow.addWidget(self.count_lbl)
+        lay.addLayout(frow)
+        # 评分表
+        self.score_tbl = QTableWidget()
+        self.score_tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.score_tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.score_tbl.setAlternatingRowColors(True)
+        cols = [("rank", "排名", 44, False), ("name", "名称", 176, False),
+                ("cat", "分类", 72, False), ("score", "综合评分", 74, True),
+                ("f_mom", "动量分", 56, True), ("f_trend", "趋势分", 56, True),
+                ("f_flow", "资金分", 56, True), ("f_risk", "风险分", 56, True),
+                ("pct", "今日涨跌%", 74, True),
+                ("mom20", "20日%", 66, True), ("mom60", "60日%", 66, True),
+                ("ytd", "年内%", 60, True), ("vol", "年化波动%", 74, True),
+                ("sharpe", "夏普", 56, True), ("mdd", "最大回撤%", 74, False),
+                ("main_in", "主力(万)", 76, True), ("amount", "成交额(亿)", 84, True),
+                ("premium", "溢价%*", 64, True),
+                ("rsi", "RSI", 50, True), ("macdSt", "MACD", 50, True)]
+        self.score_tbl.setColumnCount(len(cols))
+        self.score_tbl.setHorizontalHeaderLabels([c[1] for c in cols])
+        for i, c in enumerate(cols):
+            self.score_tbl.setColumnWidth(i, c[2])
+        self.score_cols = [c[0] for c in cols]
+        self._sort_def = {c[0]: c[3] for c in cols}
+        self._hdr_base = [c[1] for c in cols]
+        self.score_tbl.setSortingEnabled(False)
+        hh = self.score_tbl.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionsClickable(True)
+        hh.setToolTip("点击任意列标题排序, 再点同一列切换升/降序")
+        hh.sectionClicked.connect(self._on_sort)
+        self.score_tbl.verticalHeader().setVisible(False)
+        self.score_tbl.clicked.connect(self._pick_from_score)
+        self.score_tbl.doubleClicked.connect(self._on_score_dbl)
+        lay.addWidget(self.score_tbl)
+        self.tabs.addTab(w, " 评分排名 ")
+
+    def _tab_kline(self):
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        left = QVBoxLayout()
+        self.cat_cb = QComboBox()
+        self.cat_cb.currentIndexChanged.connect(lambda _: self._fill_list())
+        left.addWidget(self.cat_cb)
+        from PySide6.QtWidgets import QListWidget
+        self.etf_list = QListWidget()
+        self.etf_list.currentItemChanged.connect(self._pick_from_list)
+        left.addWidget(self.etf_list, 1)
+        lw = QWidget(); lw.setLayout(left); lw.setMaximumWidth(270)
+        lay.addWidget(lw)
+        right = QVBoxLayout()
+        self.sub_mode = QComboBox()
+        self.sub_mode.addItems(["MACD", "RSI", "KDJ"])
+        self.sub_mode.currentTextChanged.connect(lambda _: self.draw_kline())
+        top = QHBoxLayout()
+        top.addWidget(QLabel("副图:"))
+        top.addWidget(self.sub_mode)
+        top.addStretch(1)
+        self.kinfo = QLabel("")
+        self.kinfo.setObjectName("meta")
+        top.addWidget(self.kinfo)
+        right.addLayout(top)
+        self.kchart = ChartWidget(figsize=(10, 7))
+        self.kchart.canvas.mpl_connect("button_press_event", self._kline_click)
+        self._k_ctx = None
+        right.addWidget(self.kchart, 1)
+        rw = QWidget(); rw.setLayout(right)
+        lay.addWidget(rw, 1)
+        self.tabs.addTab(w, " K线图表 ")
+
+    def _tab_corr(self):
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        ctrl = QVBoxLayout()
+        g1 = QGroupBox("范围")
+        v1 = QVBoxLayout(g1)
+        self.corr_scope = QComboBox()
+        self.corr_scope.addItems(["全部", "各分类龙头", "成交额前25", "成交额前40",
+                                  "评分前20", "当前分类"])
+        self.corr_scope.setToolTip("默认「全部」= 池里所有有 K 线的标的都进矩阵。\n"
+                                   "同指数不同管理人的 ETF 相关性恒接近 1, 全表会一片红; "
+                                   "看分散化价值请用「各分类龙头」")
+        v1.addWidget(self.corr_scope)
+        hb0 = QHBoxLayout()
+        hb0.setSpacing(4)
+        self.corr_cnt = QLabel("参与计算 — 只")
+        self.corr_cnt.setObjectName("meta")
+        self.corr_cnt.setWordWrap(True)
+        hb0.addWidget(self.corr_cnt, 1)
+        bc = QPushButton(" 名单 ")
+        bc.setToolTip("列出这次参与计算的每一只, 以及被排除的标的与原因")
+        bc.clicked.connect(self._corr_names_dialog)
+        hb0.addWidget(bc)
+        v1.addLayout(hb0)
+        g2 = QGroupBox("窗口(交易日)")
+        v2 = QVBoxLayout(g2)
+        self.corr_days = QComboBox()
+        self.corr_days.addItems(["60", "120", "250"])
+        v2.addWidget(self.corr_days)
+        btn = QPushButton(" 重算相关性 ")
+        btn.clicked.connect(self.draw_corr)
+        v2.addWidget(btn)
+        ctrl.addWidget(g1)
+        ctrl.addWidget(g2)
+        self.corr_info = QLabel(
+            "怎么读: 一格=两只ETF日涨跌的同步程度。深红(≈1)同涨同跌, 同时买两只等于\n"
+            "把仓位压在一个方向上; 偏绿或发暗(≈0)各走各的, 组合才能真的降波动。\n"
+            "行序按相似度聚过, 红块连成一片 = 那一团是同一个风险源。\n"
+            "点矩阵里任意一格(或下面配对表任一行), 图下方立刻出这两只的\n"
+            "归一走势 + 滚动20日相关, 看它们到底是哪天开始分岔的。\n"
+            "配对表选「全部配对」= 列出所有 n(n−1)/2 对, 点列头排序、搜索框按代码筛。")
+        self.corr_info.setWordWrap(True)
+        self.corr_info.setObjectName("meta")
+        ctrl.addWidget(self.corr_info)
+        self.corr_pair_lbl = QLabel("配对清单")
+        self.corr_pair_lbl.setObjectName("meta")
+        ctrl.addWidget(self.corr_pair_lbl)
+        self.corr_pair_mode = QComboBox()
+        self.corr_pair_mode.addItems(["全部配对", "同涨 前40", "分散 前40", "同涨+分散 各40"])
+        self.corr_pair_mode.setToolTip("矩阵里每一对都能点; 这里是把极端配对直接列出来, 免得靠眼睛找。\n"
+                                       "选「全部配对」会把 n×(n−1)/2 对全部列出来, 再多也能靠搜索和排序找到")
+        self.corr_pair_mode.currentIndexChanged.connect(lambda _: self._fill_corr_pairs())
+        ctrl.addWidget(self.corr_pair_mode)
+        self.corr_pair_search = QLineEdit()
+        self.corr_pair_search.setPlaceholderText("筛配对: 代码或名称")
+        self.corr_pair_search.setClearButtonEnabled(True)
+        self.corr_pair_search.textChanged.connect(self._corr_filter_later)
+        ctrl.addWidget(self.corr_pair_search)
+        pt = QTableWidget()
+        pt.setColumnCount(4)
+        pt.setHorizontalHeaderLabels(["关系", "标的A", "标的B", "相关"])
+        pt.verticalHeader().setVisible(False)
+        pt.verticalHeader().setDefaultSectionSize(21)
+        pt.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        pt.setSelectionBehavior(QAbstractItemView.SelectRows)
+        pt.setAlternatingRowColors(True)
+        pt.setColumnWidth(0, 40)
+        pt.setColumnWidth(1, 110)
+        pt.setColumnWidth(2, 110)
+        pt.setColumnWidth(3, 48)
+        ph = pt.horizontalHeader()
+        ph.setSectionResizeMode(2, QHeaderView.Stretch)
+        ph.setSectionResizeMode(3, QHeaderView.Fixed)
+        ph.setSectionResizeMode(0, QHeaderView.Fixed)
+        pt.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        pt.clicked.connect(self._on_corr_pair_pick)
+        ph.setSectionsClickable(True)
+        ph.sectionClicked.connect(self._corr_sort_by)
+        ph.setSortIndicatorShown(True)
+        ph.setSortIndicator(3, Qt.DescendingOrder)
+        self.corr_pairs = pt
+        ctrl.addWidget(pt, 1)
+        cw = QWidget()
+        cw.setLayout(ctrl)
+        cw.setFixedWidth(384)   # 再窄配对表 4 列就被裁掉了(横滚是关掉的)
+        lay.addWidget(cw)
+        self.corr_chart = ChartWidget(figsize=(9, 7.6))
+        lay.addWidget(self.corr_chart, 1)
+        self.corr_chart.canvas.mpl_connect("button_press_event", self._corr_click)
+        self.corr_chart.canvas.mpl_connect("motion_notify_event", self._corr_hover)
+        self._corr_pair = None
+        self._corr_ctx = None
+        self._corr_show = []
+        self._corr_sort = (3, True)          # (列, 是否降序)
+        self._corr_filter = QTimer(self)
+        self._corr_filter.setSingleShot(True)
+        self._corr_filter.setInterval(260)
+        self._corr_filter.timeout.connect(lambda: self._fill_corr_pairs())
+        self._corr_pairs_all = []
+        self._corr_names_all = []
+        # 换范围/换窗口立刻重算: 以前只认「重算」按钮, 选了「全部」看着还是那几个
+        self.corr_scope.currentIndexChanged.connect(lambda _: self._corr_reset())
+        self.corr_days.currentIndexChanged.connect(lambda _: self._corr_reset())
+        self.tabs.addTab(w, " 相关性矩阵 ")
+
+    def _corr_reset(self):
+        """换范围/窗口后旧的那对标的已不在同一张表里, 先清掉再重算。"""
+        self._corr_pair = None
+        self.draw_corr()
+
+    def _corr_names_dialog(self):
+        """把这次真正参与计算的和被排除的名单摊开, 免得只看到一个 n。"""
+        a = self.analyzer
+        part = getattr(self, "_corr_part", []) or []
+        used = {c for c, _ in part}
+        lines = ["参与计算 %d 只 · 近 %s 个交易日" % (len(part), self.corr_days.currentText()),
+                 "", "代码      名称"]
+        for c, nm in sorted(part, key=lambda x: x[1]):
+            lines.append("%s  %s" % (c, nm))
+        out = [e for e in a.etfs if e["code"] not in used]
+        if out:
+            lines += ["", "未参与 %d 只 · 代码      名称" % len(out)]
+            for e in out:
+                k = a.kline.get(e["code"]) or []
+                why = "无K线(未上市)" if not k else "K线 %d 日, 不足窗口" % len(k)
+                lines.append("%s  %s  ·  %s" % (e["code"], e["name"], why))
+        d = QDialog(self)
+        d.setWindowTitle("参与相关性计算的标的")
+        d.resize(540, 640)
+        v = QVBoxLayout(d)
+        te = QTextEdit()
+        te.setReadOnly(True)
+        te.setPlainText("\n".join(lines))
+        v.addWidget(te)
+        b = QPushButton(" 复制名单 ")
+        b.clicked.connect(lambda: QApplication.clipboard().setText("\n".join(lines)))
+        v.addWidget(b)
+        d.exec()
+
+    def _tab_risk(self):
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        left = QVBoxLayout()
+        lbl = QLabel(
+            "怎么读\n"
+            "横轴=这段时间抖了多少(区间波动幅度), 纵轴=这段涨跌。\n"
+            "左上=涨得多、抖得少; 右下=又抖又亏。颜色=收益÷波动,\n"
+            "红(≥1)=赚的比抖的多, 绿(负)=白担风险。\n"
+            "单击圆点=看是哪只, 双击=跳到K线; 右边表是散点里全部标的的清单。")
+        lbl.setWordWrap(True)
+        lbl.setObjectName("meta")
+        left.addWidget(lbl)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("区间"))
+        self.risk_win = QComboBox()
+        self.risk_win.addItems(["今日", "3日", "5日", "10日", "15日", "20日", "60日"])
+        self.risk_win.setCurrentText("5日")
+        self.risk_win.setToolTip("换区间后横纵轴一起重算, 点位的相对位置会变")
+        self.risk_win.currentIndexChanged.connect(lambda _: self.draw_risk())
+        row.addWidget(self.risk_win, 1)
+        left.addLayout(row)
+
+        self.risk_scope = QComboBox()
+        self.risk_scope.addItems(["成交额前40", "全部", "当前分类"])
+        self.risk_scope.setToolTip("全部 160+ 只时会很挤, 默认只看成交额前 40")
+        self.risk_scope.currentIndexChanged.connect(lambda _: self.draw_risk())
+        left.addWidget(self.risk_scope)
+
+        self.risk_sel_lbl = QLabel("点图中圆点看名称")
+        self.risk_sel_lbl.setWordWrap(True)
+        self.risk_sel_lbl.setStyleSheet(
+            "color:%s; background:%s; border-left:3px solid %s; padding:4px 8px;"
+            % (TXT, PANEL2, ACCENT))
+        left.addWidget(self.risk_sel_lbl)
+
+        rl = QLabel("全部标的按收益/波动排序 · 点列头换排序")
+        rl.setObjectName("meta")
+        self.risk_cnt = rl
+        left.addWidget(rl)
+        rt = QTableWidget()
+        rt.setColumnCount(6)
+        rt.setHorizontalHeaderLabels(["名称", "代码", "分类", "区间%", "波动%", "收益/波动"])
+        rt.verticalHeader().setVisible(False)
+        rt.verticalHeader().setDefaultSectionSize(22)
+        rt.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        rt.setSelectionBehavior(QAbstractItemView.SelectRows)
+        rt.setAlternatingRowColors(True)
+        for i, wd in enumerate((118, 56, 78, 54, 54, 62)):
+            rt.setColumnWidth(i, wd)
+        rh0 = rt.horizontalHeader()
+        rh0.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 6):
+            rh0.setSectionResizeMode(i, QHeaderView.Fixed)
+        rh0.setSectionsClickable(True)
+        rh0.sectionClicked.connect(self._on_risk_sort)
+        rt.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        rt.clicked.connect(self._on_risk_pick)
+        rt.doubleClicked.connect(self._on_risk_dbl)
+        self.risk_tbl = rt
+        self._risk_sort = (5, True)      # (列, 是否降序)
+        left.addWidget(rt, 1)
+        self._risk_pts = []
+        self._risk_all = []
+        self._risk_ranked = []
+        self._risk_ax = None
+        self._risk_sel = None
+        lw = QWidget()
+        lw.setLayout(left)
+        lw.setFixedWidth(438)      # 6 列要放得下, 太窄右侧列会被裁掉
+        lay.addWidget(lw)
+        self.risk_chart = ChartWidget(figsize=(9.4, 7))
+        lay.addWidget(self.risk_chart, 1)
+        self.risk_chart.canvas.mpl_connect("button_press_event", self._risk_click)
+        self.risk_chart.canvas.mpl_connect("motion_notify_event", self._risk_hover)
+        self.risk_chart.canvas.mpl_connect("resize_event", self._risk_resize)
+        self.tabs.addTab(w, " 风险收益 ")
+
+    # ---- 散点交互: 点选看名称, 双击跳 K线
+    def _risk_hit(self, ev, tol=13):
+        try:
+            r = self.risk_chart.canvas.devicePixelRatio() or 1.0
+        except Exception:
+            r = 1.0
+        tol = tol * max(1.0, r)
+        ax = self._risk_ax
+        xy = getattr(self, "_risk_xy", None)
+        if ax is None or ev.x is None or xy is None or not len(xy):
+            return None
+        d = (xy[:, 0] - ev.x) ** 2 + (xy[:, 1] - ev.y) ** 2
+        i = int(np.argmin(d))
+        return i if d[i] < tol * tol else None
+
+    def _risk_sync_xy(self):
+        """画布尺寸变了, 显示坐标要重算, 否则鼠标总是点不中圆点。"""
+        d = getattr(self, "_risk_data", None)
+        if self._risk_ax is None or not d:
+            self._risk_xy = None
+            return
+        try:
+            self._risk_xy = self._risk_ax.transData.transform(
+                np.column_stack([d[0], d[1]]))
+        except Exception:
+            self._risk_xy = None
+
+    def _risk_resize(self, _ev):
+        self._risk_sync_xy()
+
+    def _risk_click(self, ev):
+        i = self._risk_hit(ev)
+        if i is None:
+            return
+        p = self._risk_all[i]
+        if getattr(ev, "dblclick", False):
+            self._select_code(p["code"])
+            self.tabs.setCurrentIndex(1)
+            return
+        self._risk_sel = p["code"]
+        self.draw_risk()
+
+    def _risk_hover(self, ev):
+        if ev.inaxes is None or self._risk_ax is None:
+            return
+        i = self._risk_hit(ev)
+        if i is None:
+            return
+        p = self._risk_all[i]
+        self.risk_sel_lbl.setText(
+            "%s (%s)\n%s %+.2f%% · 波动 %.2f%% · 收益/波动 %s"
+            % (p["name"], p["code"], self.risk_win.currentText(), p["ret"],
+               p["amp"] or 0, n0(p["ratio"], 2)))
+
+    def _on_risk_pick(self, idx):
+        if 0 <= idx.row() < len(self._risk_pts):
+            self._risk_sel = self._risk_pts[idx.row()]["code"]
+            self.draw_risk()
+
+    def _on_risk_dbl(self, idx):
+        if 0 <= idx.row() < len(self._risk_pts):
+            self._select_code(self._risk_pts[idx.row()]["code"])
+            self.tabs.setCurrentIndex(1)
+
+    def _tab_rot(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(6, 4, 6, 4)
+        v.setSpacing(4)
+
+        self.rot_concl = QLabel("")
+        self.rot_concl.setWordWrap(True)
+        self.rot_concl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.rot_concl.setStyleSheet(
+            "color:%s; background:%s; border-left:3px solid %s; padding:5px 9px; font-size:12px;"
+            % (TXT, PANEL2, ACCENT))
+        v.addWidget(self.rot_concl)
+
+        body = QHBoxLayout()
+        body.setSpacing(7)
+
+        # ---- 左: 窗口 + 分类排名表
+        left = QWidget()
+        left.setFixedWidth(468)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(3)
+        wrow = QHBoxLayout()
+        wrow.setSpacing(4)
+        wl = QLabel("动量窗口")
+        wl.setObjectName("meta")
+        wrow.addWidget(wl)
+        self.rot_win = QComboBox()
+        for lab, wv in (("今日", 0), ("3日", 3), ("5日", 5), ("10日", 10),
+                        ("15日", 15), ("20日", 20), ("60日", 60)):
+            self.rot_win.addItem(lab, wv)
+        self.rot_win.setCurrentIndex(5)
+        self.rot_win.setFixedWidth(78)
+        self.rot_win.currentIndexChanged.connect(lambda _: self.draw_rot())
+        wrow.addWidget(self.rot_win)
+        hint = QLabel("流入/流出按日逐只累加, 非席位主力资金")
+        hint.setObjectName("meta")
+        hint.setToolTip("资金 = 成交额 × CLV, CLV=(2×收-高-低)/(高-低), 收在当日区间上半为流入、\n"
+                        "下半为流出。它是二级市场买卖压力的代理, 不是席位主力净买额。")
+        wrow.addWidget(hint, 1)
+        lv.addLayout(wrow)
+
+        rcols = [("name", "分类", 152, False), ("pct", "今日%", 52, True),
+                 ("cur", "动量%", 56, True), ("fin", "流入亿", 54, True),
+                 ("fout", "流出亿", 54, True), ("fnet", "净额亿", 56, True)]
+        self.rot_cols = [c[0] for c in rcols]
+        self.rot_hdr = [c[1] for c in rcols]
+        rt = QTableWidget()
+        rt.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        rt.setSelectionBehavior(QAbstractItemView.SelectRows)
+        rt.setSelectionMode(QAbstractItemView.SingleSelection)
+        rt.setAlternatingRowColors(True)
+        rt.setColumnCount(len(rcols))
+        rt.setHorizontalHeaderLabels([c[1] for c in rcols])
+        rt.verticalHeader().setVisible(False)
+        rt.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        rt.verticalHeader().setDefaultSectionSize(24)
+        for i, c in enumerate(rcols):
+            rt.setColumnWidth(i, c[2])
+        rh = rt.horizontalHeader()
+        rh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, len(rcols)):
+            rh.setSectionResizeMode(i, QHeaderView.Fixed)
+        rt.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        rh.setSectionsClickable(True)
+        rh.setToolTip("点列标题排序, 再点一次切升降")
+        rh.setDefaultAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        rh.sectionClicked.connect(self._on_rot_sort)
+        rt.clicked.connect(self._on_rot_pick)
+        hf = QFont()
+        hf.setPointSize(9)
+        rt.horizontalHeader().setFont(hf)
+        rt.horizontalHeaderItem(0).setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.rot_tbl = rt
+        self.rot_sort, self.rot_desc = "cur", True
+        self.rot_view = []
+        lv.addWidget(rt, 1)
+        body.addWidget(left)
+
+        # ---- 右: 上=柱图, 下=多周期对照
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(3)
+        self.rot_bar = ChartWidget(figsize=(9.6, 7.4), toolbar=False)
+        rv.addWidget(self.rot_bar, 1)
+        body.addWidget(right, 1)
+        v.addLayout(body, 1)
+        self.rot_bar.canvas.mpl_connect("button_press_event", self._rot_click)
+        self._rot_names = []
+        self._rot_axes = []
+        self.tabs.addTab(w, " 板块轮动 ")
+
+    # ---- 排序 / 点选
+    @property
+    def rot_w(self):
+        return int(self.rot_win.currentData() or 0)
+
+    def _on_rot_sort(self, col):
+        if not (0 <= col < len(self.rot_cols)):
+            return
+        k = self.rot_cols[col]
+        if k in ("name", "n"):
+            return
+        if k == self.rot_sort:
+            self.rot_desc = not self.rot_desc
+        else:
+            self.rot_sort, self.rot_desc = k, True
+        self.draw_rot()
+
+    def _on_rot_pick(self, idx):
+        r = idx.row()
+        if 0 <= r < len(self.rot_view):
+            self.rot_hl = self.rot_view[r]["name"]
+            self._draw_rot_bars(self.rot_view, self.rot_w, hl=self.rot_hl)
+
+    def _rot_click(self, ev):
+        """点柱图任一根柱 = 选中左侧同一行; 数据用当前窗口的口径。"""
+        if getattr(ev, "button", 1) != 1 or ev.inaxes is None:
+            return
+        if ev.inaxes not in getattr(self, "_rot_axes", []):
+            return
+        names = getattr(self, "_rot_names", [])
+        if not names or ev.ydata is None:
+            return
+        i = int(round(ev.ydata))
+        if not (0 <= i < len(names)) or i >= len(self.rot_view):
+            return
+        self.rot_hl = names[i]
+        t = self.rot_tbl
+        t.blockSignals(True)
+        t.selectRow(i)
+        t.blockSignals(False)
+        it = t.item(i, 0)
+        if it is not None:
+            t.scrollToItem(it, QAbstractItemView.PositionAtCenter)
+        self._draw_rot_bars(self.rot_view, self.rot_w, hl=self.rot_hl)
+        r = self.rot_view[i]
+        self.status.setText(
+            "%s · 今日 %s%% · %s %s%% · 流入 %.1f 亿 · 流出 %.1f 亿 · 净额 %+.1f 亿"
+            % (r["name"], n0(r["pct"]), self.analyzer.rot_label(self.rot_w), n0(r["cur"], 1),
+               r["fin"] or 0, abs(r["fout"] or 0), r["fnet"] or 0))
+
+    def _rot_rows(self, w=None):
+        """把 rot 整理成可排序的行"""
+        rot = self.analyzer.rot
+        w = self.rot_w if w is None else w
+        cur_map = rot["cur_by_w"].get(w, {})
+        chg_map = rot["chg_by_w"].get(w, {})
+        out = []
+        for c in rot["cats"]:
+            cur = cur_map.get(c)
+            out.append({"name": c, "n": rot["n_mem"].get(c, 0),
+                        "pct": rot["pct_today"].get(c),
+                        "cur": None if cur != cur else cur,
+                        "chg": chg_map.get(c, 0),
+                        "fin": rot["fin"].get((c, w), 0.0),
+                        "fout": rot["fout"].get((c, w), 0.0),
+                        "fnet": rot["fnet"].get((c, w), 0.0),
+                        "flow": (rot["flow"].get(c) or 0) / 1e4,
+                        "rank": rot["rank_by_w"].get(w, {}).get(c)})
+        k, desc = self.rot_sort, self.rot_desc
+        if k:
+            ok = [r for r in out if isinstance(r.get(k), (int, float)) and r.get(k) == r.get(k)]
+            no = [r for r in out if r not in ok]
+            ok.sort(key=lambda r: r[k], reverse=desc)
+            out = ok + no
+        return out
+
+    # ---------------- 页6: 指数 x ETF 进出 ----------------
+    STATE_BG = {"进场确认": "#8c2f2f", "启动中": "#5a2929",
+                "观望": "#2b2f3a", "退潮": "#1f3a33", "撤离": "#1b5344"}
+    STATE_FG = {"进场确认": "#ffd9d9", "启动中": "#f0b9b9",
+                "观望": SUB, "退潮": "#8fd4bd", "撤离": "#d9fff1"}
+
+    def _lbl_meta(self, txt):
+        lb = QLabel(txt)
+        lb.setObjectName("meta")
+        return lb
+
+    def _tab_index(self):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(6, 4, 6, 4)
+        h.setSpacing(7)
+
+        # ---- 左: 指数清单
+        lw = QWidget()
+        lw.setFixedWidth(212)
+        lv = QVBoxLayout(lw)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(3)
+        lv.addWidget(self._lbl_meta("点选切换　红底=进 绿底=撤　蓝字=跨境"))
+
+        self.idx_rest = QLabel("")
+        self.idx_rest.setObjectName("meta")
+        self.idx_rest.setWordWrap(True)
+        lv.addWidget(self.idx_rest)
+        lt = QTableWidget()
+        lt.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        lt.setSelectionBehavior(QAbstractItemView.SelectRows)
+        lt.setSelectionMode(QAbstractItemView.SingleSelection)
+        lt.setShowGrid(False)
+        lt.setColumnCount(3)
+        lt.setHorizontalHeaderLabels(["指数", "今日%", "评分"])
+        lt.verticalHeader().setVisible(False)
+        lt.verticalHeader().setDefaultSectionSize(27)
+        lh = lt.horizontalHeader()
+        lh.setSectionResizeMode(0, QHeaderView.Stretch)
+        lh.setSectionResizeMode(1, QHeaderView.Fixed)
+        lh.setSectionResizeMode(2, QHeaderView.Fixed)
+        lt.setColumnWidth(1, 62)
+        lt.setColumnWidth(2, 46)
+        lh.setSectionsClickable(False)
+        lt.clicked.connect(self._on_idx_pick)
+        self.idx_list = lt
+        lv.addWidget(lt, 1)
+        h.addWidget(lw)
+
+        # ---- 右: 图形 + ETF 明细
+        rw = QWidget()
+        rv = QVBoxLayout(rw)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.flow_title = QLabel("—")
+        top.addWidget(self.flow_title)
+        self.flow_meta = QLabel("加载中…")
+        self.flow_meta.setObjectName("meta")
+        top.addWidget(self.flow_meta, 1)
+        self.btn_back = QPushButton(" ← 回到全部ETF ")
+        self.btn_back.clicked.connect(self._back_to_group)
+        self.btn_back.setVisible(False)
+        top.addWidget(self.btn_back)
+        self.btn_flow = QPushButton(" 刷新数据 ")
+        self.btn_flow.clicked.connect(self.reload_index)
+        top.addWidget(self.btn_flow)
+        rv.addLayout(top)
+
+        self.flow_concl = QLabel("")
+        self.flow_concl.setWordWrap(True)
+        self.flow_concl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.flow_concl.setMinimumHeight(24)
+        self.flow_concl.setStyleSheet(
+            "color:%s; background:%s; border-left:3px solid %s; padding:5px 9px; font-size:12px;"
+            % (TXT, PANEL2, ACCENT))
+        rv.addWidget(self.flow_concl)
+
+        cw = QWidget()
+        cv = QVBoxLayout(cw)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(2)
+        self.flow_chart = ChartWidget(figsize=(9, 4.2))
+        self.flow_chart.canvas.mpl_connect("button_press_event", self._flow_click)
+        self._flow_ctx = None
+        cv.addWidget(self.flow_chart, 1)
+        self.flow_note = QLabel("")
+        self.flow_note.setObjectName("meta")
+        self.flow_note.setWordWrap(True)
+        cv.addWidget(self.flow_note)
+        rv.addWidget(cw, 3)
+
+        tw = QWidget()
+        tv = QVBoxLayout(tw)
+        tv.setContentsMargins(0, 0, 0, 0)
+        tv.setSpacing(2)
+        self.idx_detail_lbl = QLabel("跟踪该指数的场内 ETF · 点列标题排序 · 双击跳 K 线")
+        self.idx_detail_lbl.setObjectName("meta")
+        tv.addWidget(self.idx_detail_lbl)
+        dcols = [("name", "ETF 名称", 186, False), ("code", "代码", 64, False),
+                 ("pct", "涨跌%", 62, True), ("amt", "成交亿", 70, True),
+                 ("mi", "净流入亿", 82, True), ("stg", "强度%", 64, True),
+                 ("mom5", "5日动能亿", 78, True), ("prem", "溢价%*", 66, True),
+                 ("turnover", "换手%", 60, True), ("vol_ratio", "量比", 54, True)]
+        self.det_cols = [c[0] for c in dcols]
+        self.det_hdr = [c[1] for c in dcols]
+        d = QTableWidget()
+        d.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        d.setSelectionBehavior(QAbstractItemView.SelectRows)
+        d.setSelectionMode(QAbstractItemView.SingleSelection)
+        d.setAlternatingRowColors(True)
+        d.setColumnCount(len(dcols))
+        d.setHorizontalHeaderLabels([c[1] for c in dcols])
+        d.verticalHeader().setVisible(False)
+        d.verticalHeader().setDefaultSectionSize(22)
+        for i, c in enumerate(dcols):
+            d.setColumnWidth(i, c[2])
+        dh = d.horizontalHeader()
+        for i in range(len(dcols)):
+            dh.setSectionResizeMode(i, QHeaderView.Stretch)
+        dh.setSectionResizeMode(0, QHeaderView.Fixed)
+        dh.setSectionResizeMode(1, QHeaderView.Fixed)
+        d.setColumnWidth(0, 208)
+        d.setColumnWidth(1, 70)
+        dh.setSectionsClickable(True)
+        dh.setToolTip("点列标题排序, 再点一次切升降")
+        dh.sectionClicked.connect(self._on_det_sort)
+        d.clicked.connect(self._on_det_pick)
+        d.doubleClicked.connect(self._on_idx_detail_pick)
+        self.idx_det = d
+        tv.addWidget(d, 1)
+        rv.addWidget(tw)
+        h.addWidget(rw, 1)
+
+        self.tabs.addTab(w, " 指数·ETF进出 ")
+        self.idx_groups = []
+        self.cur_idx = None
+        self.det_sort, self.det_desc = None, True
+        self._det_rows, self._det_code = [], []
+
+
+    # ---------------- 页7: ETF 成分股 ----------------
+    def _tab_hold(self):
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(7)
+
+        left = QVBoxLayout()
+        left.setSpacing(3)
+        self.hold_meta = self._lbl_meta("标的 · 点选查看重仓股")
+        left.addWidget(self.hold_meta)
+        self.hold_cat = QComboBox()
+        self.hold_cat.addItem("全部")
+        self.hold_cat.currentIndexChanged.connect(lambda _: self._fill_hold_list())
+        left.addWidget(self.hold_cat)
+        self.hold_search = QLineEdit()
+        self.hold_search.setPlaceholderText("搜代码 / 名称")
+        self.hold_search.setClearButtonEnabled(True)
+        self.hold_search.textChanged.connect(lambda _: self._fill_hold_list())
+        left.addWidget(self.hold_search)
+        self.hold_list = QListWidget()
+        self.hold_list.currentItemChanged.connect(self._on_hold_pick)
+        left.addWidget(self.hold_list, 1)
+        hb = QHBoxLayout()
+        b1 = QPushButton(" 重取该只 ")
+        b1.setToolTip("忽略本地缓存, 重新拉这一只的季报持仓(会顺带补上一季度, 用于算环比)")
+        b1.clicked.connect(lambda: self._load_hold(force=True))
+        hb.addWidget(b1)
+        b2 = QPushButton(" 复制表格 ")
+        b2.setToolTip("把当前表格按屏幕顺序复制成制表符分隔文本, 可直接贴进 Excel / 文档")
+        b2.clicked.connect(self._copy_hold)
+        hb.addWidget(b2)
+        left.addLayout(hb)
+        hb2 = QHBoxLayout()
+        self.hold_batch = QPushButton(" 补全全部 ")
+        self.hold_batch.setToolTip("对池内全部 168 只逐个拉季报持仓(不受上面分类/搜索筛选影响),\n"
+                                   "已有明细的会跳过; 168 只约 1-2 分钟, 再点一次可停止")
+        self.hold_batch.clicked.connect(self._batch_hold)
+        hb2.addWidget(self.hold_batch)
+        self.hold_inst = QPushButton(" 刷新机构 ")
+        self.hold_inst.setToolTip("重新拉季度机构持仓(社保/QFII/保险/券商/信托/基金)与陆股通持股,\n"
+                                  "一次覆盖全市场, 约 40 秒。已有缓存时直接读本地库, 不必点它")
+        self.hold_inst.clicked.connect(self._refresh_inst)
+        hb2.addWidget(self.hold_inst)
+        left.addLayout(hb2)
+        hb3 = QHBoxLayout()
+        b3 = QPushButton(" 列宽缩到一屏 ")
+        b3.setToolTip("把 18 列按比例压进当前窗口宽度, 一屏看完不用拖;\n"
+                      "想给某列更多位置, 直接拖表头的分隔线")
+        b3.clicked.connect(self._fit_hold_cols)
+        hb3.addWidget(b3)
+        left.addLayout(hb3)
+        lw = QWidget()
+        lw.setLayout(left)
+        lw.setFixedWidth(262)
+        lay.addWidget(lw)
+
+        right = QVBoxLayout()
+        right.setSpacing(4)
+        self.hold_title = QLabel("选左侧任一 ETF")
+        self.hold_title.setWordWrap(True)
+        self.hold_title.setStyleSheet(
+            "color:%s; background:%s; border-left:3px solid %s; padding:5px 9px;"
+            % (TXT, PANEL2, ACCENT))
+        right.addWidget(self.hold_title)
+        self.hold_src = QLabel("机构/北向数据: 读取中…")
+        self.hold_src.setObjectName("meta")
+        self.hold_src.setWordWrap(True)
+        right.addWidget(self.hold_src)
+        ht = QTableWidget()
+        hcols = [("rank", "排名", 40), ("stock", "代码", 74), ("sname", "名称", 96),
+                 ("pct", "占净值%", 62), ("wchg", "环比pp", 56),
+                 ("cum", "累计%", 54),
+                 ("shares", "持股万股", 76), ("value", "市值万元", 76),
+                 ("price", "现价", 58), ("pct_today", "当日%", 58),
+                 ("turnover", "换手%", 54), ("amt", "成交亿", 58),
+                 ("pe", "PE", 46), ("mcap", "流通亿", 60),
+                 ("hsgt", "北向%", 56), ("mflow", "主力万", 66),
+                 ("inst", "社保/险/QFII", 146), ("ind", "所属行业", 96)]
+        self.hold_cols = [c[0] for c in hcols]
+        ht.setColumnCount(len(hcols))
+        ht.setHorizontalHeaderLabels([c[1] for c in hcols])
+        ht.verticalHeader().setVisible(False)
+        ht.verticalHeader().setDefaultSectionSize(22)
+        ht.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        ht.setSelectionBehavior(QAbstractItemView.SelectRows)
+        ht.setAlternatingRowColors(True)
+        for i, c in enumerate(hcols):
+            ht.setColumnWidth(i, c[2])
+        hh = ht.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)   # 列宽自己拖, 名称不再吃掉全部余量
+        hh.setMinimumSectionSize(34)
+        hh.setSectionsClickable(True)
+        hh.setSortIndicatorShown(True)
+        hh.setSortIndicator(0, Qt.AscendingOrder)
+        hh.setToolTip("点列标题排序, 再点一次切升降")
+        hh.sectionClicked.connect(self._sort_hold)
+        ht.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        ht.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        ht.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)   # 18 列总宽超过窗口时必须能拖出来
+        self.hold_tbl = ht
+        right.addWidget(ht, 1)
+        self.hold_note = QLabel("")
+        self.hold_note.setWordWrap(True)
+        self.hold_note.setObjectName("meta")
+        right.addWidget(self.hold_note)
+        lay.addLayout(right, 1)
+        self._hold_code = None
+        self._hold_hit = None
+        self._hold_thread = None
+        self._inst_thread = None
+        self._inst_cache = None
+        self._hold_vrows = []
+        self._hold_ctx = {}
+        self._hold_fitted = False
+        self._hold_sort = (0, False)      # (列, 是否降序), 默认按排名升序
+        self.tabs.addTab(w, " ETF成分股 ")
+
+    def _fill_hold_list(self):
+        a = self.analyzer
+        if not a:
+            return
+        cats = sorted({e["category"] for e in a.etfs})
+        cur = self.hold_cat.currentText()
+        if self.hold_cat.count() <= 1:
+            self.hold_cat.blockSignals(True)
+            self.hold_cat.addItems(cats)
+            self.hold_cat.blockSignals(False)
+        try:
+            has = etf_hold.cached_codes(str(etf_app.DB))
+            cnt = etf_hold.cached_counts(str(etf_app.DB))
+        except Exception:
+            has, cnt = set(), {}
+        kw = self.hold_search.text().strip()
+        self.hold_list.blockSignals(True)
+        self.hold_list.clear()
+        n_all = n_has = 0
+        for e in sorted(a.etfs, key=lambda x: (x["category"], x["code"])):
+            if cur not in ("全部", "") and e["category"] != cur:
+                continue
+            if kw and kw not in e["code"] and kw not in e["name"]:
+                continue
+            n_all += 1
+            ok = e["code"] in has
+            n_has += 1 if ok else 0
+            nrow = cnt.get(e["code"]) or 0
+            it = QListWidgetItem("%s %s %s%s" % (
+                "●" if ok else "○", e["code"], e["name"],
+                ("  %d" % nrow) if ok else ""))
+            it.setData(Qt.UserRole, e["code"])
+            it.setForeground(QColor(TXT if ok else SUB))
+            it.setToolTip("%s\n%s" % (
+                e["category"],
+                ("已有季报持仓明细, 最新季度 %d 只" % nrow) if ok
+                else "还没取过, 点「补全全部」或选中它会自动取"))
+            self.hold_list.addItem(it)
+        self.hold_meta.setText("当前列表 %d 只 · 有明细 %d 只 · 池 %d 只"
+                               % (n_all, n_has, len(a.etfs)))
+        code = self._hold_code
+        hit = -1
+        for i in range(self.hold_list.count()):
+            if self.hold_list.item(i).data(Qt.UserRole) == code:
+                hit = i
+                break
+        if self.hold_list.count():
+            if hit < 0 and self._hold_code is None:
+                for i in range(self.hold_list.count()):
+                    if self.hold_list.item(i).data(Qt.UserRole) in ("510300", "510500", "159915"):
+                        hit = i
+                        break
+            self.hold_list.setCurrentRow(hit if hit >= 0 else 0)
+        self.hold_list.blockSignals(False)
+        # 输入过滤时不要每次都重新拉持仓: 只有选中的标的真的换了才取数
+        cur_item = self.hold_list.currentItem()
+        if cur_item is not None and cur_item.data(Qt.UserRole) != code:
+            self._load_hold(cur_item.data(Qt.UserRole))
+
+    def _on_hold_pick(self, cur, _prev=None):
+        if cur:
+            self._load_hold(cur.data(Qt.UserRole))
+
+    def _load_hold(self, code=None, force=False):
+        a = self.analyzer
+        if not a:
+            return
+        code = code or self._hold_code
+        if not code:
+            return
+        self._hold_code = code
+        e = next((x for x in a.etfs if x["code"] == code), None)
+        name = e["name"] if e else code
+        label = "%s %s" % (code, name)
+        try:
+            hit = etf_hold.fetch(code, str(etf_app.DB), force=force)
+        except Exception as ex:
+            self.hold_title.setText("%s · 取持仓失败: %s: %s" % (label, type(ex).__name__, ex))
+            self._hold_vrows = []
+            self.hold_tbl.setRowCount(0)
+            return
+        self._hold_hit = dict(hit, name=name)
+        rows = hit.get("rows") or []
+        if not rows:
+            self.hold_title.setText("%s · 暂无股票持仓披露" % label)
+            self._hold_vrows = []
+            self.hold_tbl.setRowCount(0)
+            if hit.get("err"):
+                self.hold_note.setText(
+                    "这次没取到(%s)。季报接口偶发超时, 点「刷新该只」重试。" % hit["err"])
+            else:
+                self.hold_note.setText(
+                    "货币/债券类 ETF 的资产在债券与存单里, 没有股票明细; "
+                    "跨境 ETF 持有的是海外股票, 也常常不披露到明细; "
+                    "新成立未披露季报的同样查不到。")
+            return
+        q = hit.get("quarter") or ""
+        pq = (hit.get("prev_quarter") or "").replace("股票投资明细", "")
+        self.hold_title.setText(
+            "%s · %s　前十大合计 <b>%.2f%%</b>　共 %d 只%s"
+            % (label, q.replace("股票投资明细", ""), hit.get("top10") or 0, len(rows),
+               ("　环比基准 %s" % pq) if pq else ""))
+        self.hold_title.setTextFormat(Qt.RichText)
+        qs = etf_hold.stock_quotes([r["stock"] for r in rows])
+        idate, inst_map, hsgt_map = self._inst_maps()
+        vrows = []
+        cum = 0.0
+        n_new = 0
+        for r in rows:
+            cum += r["pct"] or 0
+            if r.get("new"):
+                n_new += 1
+            q0 = qs.get(r["stock"]) or {}
+            # 北向: 季度末香港中央结算持股 / 当前流通股本
+            ratio = None
+            hg = hsgt_map.get(r["stock"])
+            if hg and q0.get("price") and q0.get("mcap"):
+                float_shares = q0["mcap"] * 1e8 / q0["price"]
+                if float_shares > 0:
+                    ratio = (hg["shares"] or 0) / float_shares * 100
+            txt, long = etf_inst.summary(r["stock"], inst_map)
+            d = inst_map.get(r["stock"]) or {}
+            i_n = sum((v.get("n") or 1) for k, v in d.items() if k != "基金")
+            vrows.append(dict(
+                rank=r["rank"], code=r["stock"], name=r["sname"], pct=r["pct"],
+                wchg=r.get("delta"), new=bool(r.get("new")), prev=r.get("prev"),
+                cum=cum, shares=r["shares"], value=r["value"],
+                price=q0.get("price"), chg=q0.get("pct"), turnover=q0.get("turnover"),
+                amt=q0.get("amt"), pe=q0.get("pe"), mcap=q0.get("mcap"),
+                hsgt=ratio, mflow=q0.get("mflow"), has_q=bool(q0),
+                inst=txt, inst_tip=long, inst_n=i_n, ind=q0.get("ind")))
+        self._hold_vrows = vrows
+        self._hold_ctx = dict(hit=hit, idate=idate, n_new=n_new, idate_ok=bool(idate),
+                              foreign=sum(1 for r in rows
+                                          if not (len(r["stock"]) == 6 and r["stock"].isdigit())))
+        self._apply_hold_sort(render=False)
+        self._render_hold()
+
+    def _render_hold(self):
+        t = self.hold_tbl
+        vrows = self._hold_vrows or []
+        t.setRowCount(len(vrows))
+        for i, r in enumerate(vrows):
+            t.setItem(i, 0, self._cell("%d" % r["rank"]))
+            itc = self._lcell(r["code"])
+            itc.setToolTip(r["code"])
+            t.setItem(i, 1, itc)
+            nm = self._lcell(r["name"])
+            nm.setToolTip(r["name"])
+            t.setItem(i, 2, nm)
+            t.setItem(i, 3, color_item("%.2f" % (r["pct"] or 0), r["pct"]))
+            # 环比: 与上一季度同一只票的占净值比之差(百分点)
+            dl = r["wchg"]
+            if dl is not None:
+                it = color_item("%+.2f" % dl, dl)
+                it.setToolTip("上季 %.2f%% → 本季 %.2f%%" % (r["prev"] or 0, r["pct"] or 0))
+            elif r["new"]:
+                it = self._cell("新")
+                it.setForeground(QColor(WARN))
+                it.setToolTip("上一季度明细里没有这只: 可能是新进, 也可能上季没披露到它")
+            else:
+                it = self._cell("—")
+                it.setForeground(QColor(SUB))
+                it.setToolTip("没有上一季度明细可比")
+            t.setItem(i, 4, it)
+            ic = self._cell("%.2f" % r["cum"])
+            ic.setForeground(QColor(SUB))
+            ic.setToolTip("按权重从大到小累加, 不随排序变化")
+            t.setItem(i, 5, ic)
+            t.setItem(i, 6, self._cell("%.0f" % (r["shares"] or 0)))   # 东财持股数就是万股
+            t.setItem(i, 7, self._cell("%.0f" % (r["value"] or 0)))
+            if not r["has_q"]:
+                for c in (8, 9, 10, 11, 12, 13, 15, 17):
+                    it = self._cell("—")
+                    it.setForeground(QColor(SUB))
+                    t.setItem(i, c, it)
+            else:
+                t.setItem(i, 8, self._cell(n0(r["price"], 2)))
+                t.setItem(i, 9, color_item("%+.2f" % (r["chg"] or 0), r["chg"]))
+                tv = r["turnover"]
+                t.setItem(i, 10, self._cell("—" if tv is None else "%.2f" % tv))
+                av = r["amt"]
+                t.setItem(i, 11, self._cell("—" if av is None else "%.2f" % av))
+                pe = r["pe"]
+                ipe = self._cell("—" if pe is None else ("亏" if pe < 0 else "%.1f" % pe))
+                if pe is not None and pe < 0:
+                    ipe.setForeground(QColor(WARN))
+                t.setItem(i, 12, ipe)
+                mc = r["mcap"]
+                t.setItem(i, 13, self._cell("—" if mc is None else "%.0f" % mc))
+                mf = r["mflow"]
+                t.setItem(i, 15, color_item("—" if mf is None else "%+.0f" % mf, mf))
+                ind = self._lcell(r["ind"] or "—")
+                ind.setForeground(QColor(SUB))
+                t.setItem(i, 17, ind)
+            rt = r["hsgt"]
+            if rt is None:
+                ih = self._cell("—")
+                ih.setForeground(QColor(SUB))
+                ih.setToolTip("十大流通股东里没有香港中央结算(北向每日持股已停止披露)")
+            else:
+                ih = self._cell("%.2f" % rt)
+                ih.setToolTip("陆股通(香港中央结算)持股, 按当前流通股本折算\n"
+                              "口径: 十大流通股东里的香港中央结算, 未进前十大的看不到")
+            t.setItem(i, 14, ih)
+            ii = self._lcell(r["inst"] or "—")
+            if r["inst"]:
+                ii.setForeground(QColor(ACCENT if ("社保" in r["inst"] or "险" in r["inst"]) else TXT))
+                ii.setToolTip(r["inst_tip"])
+            else:
+                ii.setForeground(QColor(SUB))
+                ii.setToolTip(r["inst_tip"] or "没有机构持仓披露")
+            t.setItem(i, 16, ii)
+        ctx = self._hold_ctx or {}
+        hit = ctx.get("hit") or {}
+        idate = ctx.get("idate")
+        note = ("口径: 东财基金持仓(季报披露, 滞后于最新持仓); 环比=与上一季度占净值比之差(百分点); "
+                "北向=十大流通股东里的香港中央结算 ÷ 当前流通股本(近似); "
+                "机构=社保险资等家数, 取自东财机构持仓, 报告期 %s。" % (idate or "—"))
+        if ctx.get("n_new"):
+            note += (" 标「新」的 %d 只: 上季明细里没有它 —— 可能真新进, 也可能上季披露不到它"
+                     "(上季披露 %d 只 / 本季 %d 只)。"
+                     % (ctx["n_new"], hit.get("prev_rows") or 0, len(vrows)))
+        if ctx.get("foreign"):
+            note += " 其中 %d 只海外代码(QDII), 不取实时行情。" % ctx["foreign"]
+        if hit.get("err"):
+            note += " 本次取数异常(%s), 显示的是本地缓存。" % hit["err"]
+        note += " 点表头可排序。"
+        self.hold_note.setText(note)
+
+    _HOLD_KEYS = (("rank", 0), ("code", 1), ("name", 2), ("pct", 3), ("wchg", 4),
+                  ("cum", 5), ("shares", 6), ("value", 7), ("price", 8), ("chg", 9),
+                  ("turnover", 10), ("amt", 11), ("pe", 12), ("mcap", 13),
+                  ("hsgt", 14), ("mflow", 15), ("inst_n", 16), ("ind", 17))
+
+    def _hold_key(self, r, col):
+        for k, c in self._HOLD_KEYS:
+            if c == col:
+                return r.get(k)
+        return None
+
+    def _sort_hold(self, col):
+        """点表头排序: 数字列首点降序, 文本列首点升序, 再点切反; 空值恒排最后。"""
+        if not self._hold_vrows:
+            return
+        old_col, old_desc = getattr(self, "_hold_sort", (0, False))
+        if old_col == col:
+            desc = not old_desc
+        else:
+            desc = col not in (1, 2, 17)
+        self._hold_sort = (col, desc)
+        self._apply_hold_sort(render=True)
+
+    def _apply_hold_sort(self, render=True):
+        col, desc = getattr(self, "_hold_sort", (0, False))
+        hv = list(self._hold_vrows or [])
+        if hv:
+            has, non = [], []
+            for r in hv:
+                v = self._hold_key(r, col)
+                (non if v is None or v == "" else has).append(r)
+            try:
+                has.sort(key=lambda r: self._hold_key(r, col), reverse=desc)
+            except TypeError:
+                has.sort(key=lambda r: str(self._hold_key(r, col)), reverse=desc)
+            self._hold_vrows = has + non
+        hh = self.hold_tbl.horizontalHeader()
+        hh.setSortIndicator(col, Qt.DescendingOrder if desc else Qt.AscendingOrder)
+        if render:
+            pos = self.hold_tbl.verticalScrollBar().value()
+            self._render_hold()
+            self.hold_tbl.verticalScrollBar().setValue(pos)
+
+    def _on_tab_changed(self, idx):
+        if idx == getattr(self, "_hold_tab_idx", -1):
+            QTimer.singleShot(60, self._fit_hold_once)
+
+    def _fit_hold_once(self):
+        """首次进成分股页: 18 列装不下就按窗口压一次, 之后尊重用户自己拖的宽度。"""
+        if getattr(self, "_hold_fitted", False):
+            return
+        t = self.hold_tbl
+        if t.viewport().width() < 400:
+            return
+        self._hold_fitted = True
+        if sum(t.columnWidth(i) for i in range(t.columnCount())) > t.viewport().width():
+            self._fit_hold_cols()
+
+    def _fit_hold_cols(self):
+        """把 18 列按当前比例压进窗口: 一屏看完, 不用横向拖。"""
+        t = self.hold_tbl
+        base = [t.columnWidth(i) for i in range(t.columnCount())]
+        if len(base) != 18 or sum(base) <= 0:
+            base = [40, 64, 84, 50, 46, 44, 60, 64, 48, 48, 44, 46, 38, 50, 46, 50, 104, 66]
+        avail = t.viewport().width() - 6
+        if avail < 300:
+            return
+        tot = sum(base)
+        if tot <= avail:
+            w = [int(x * avail / tot) for x in base]
+        else:
+            w = [max(34, int(x * avail / tot)) for x in base]
+        for i, x in enumerate(w):
+            t.setColumnWidth(i, x)
+        self.status.setText("列宽已缩到一屏 (%d px)" % sum(w))
+
+
+    def _inst_maps(self):
+        """机构/北向映射, 进程内缓存; 点「刷新机构」更新后清空。"""
+        d = getattr(self, "_inst_cache", None)
+        if d:
+            return d
+        try:
+            date, inst, hs = etf_inst.load(str(etf_app.DB))
+        except Exception:
+            date, inst, hs = None, {}, {}
+        self._inst_cache = (date, inst, hs)
+        if hasattr(self, "hold_src"):
+            self._set_inst_src(date, inst, hs)
+        return self._inst_cache
+
+    def _set_inst_src(self, date, inst, hs, extra=""):
+        if not date:
+            self.hold_src.setText(
+                "机构/北向: 本地还没有数据 —— 点左边「刷新机构」拉一次(约 40 秒), "
+                "拉完这两列才有数。")
+            return
+        self.hold_src.setText(
+            "机构/北向: 报告期 <b>%s</b> · 覆盖 %d 只股票 · 陆股通 %d 只%s"
+            % (date, len(inst), len(hs), (" · " + extra) if extra else ""))
+        self.hold_src.setTextFormat(Qt.RichText)
+
+    def _copy_hold(self):
+        if not self._hold_hit:
+            return
+        hit = dict(self._hold_hit)
+        if self._hold_vrows:
+            by = {r["code"]: r for r in hit.get("rows") or []}
+            seq = [by[r["code"]] for r in self._hold_vrows if r["code"] in by]
+            if seq:
+                hit["rows"] = seq      # 按当前排序导出, 和屏幕顺序一致
+        txt = etf_hold.copy_text(hit, hit.get("name", ""))
+        QApplication.clipboard().setText(txt)
+        self.hold_note.setText("已复制 %d 行到剪贴板(按当前排序)。" % len(hit.get("rows") or []))
+
+    def _batch_hold(self):
+        th = getattr(self, "_hold_thread", None)
+        if th and th.isRunning():
+            th.stop()
+            self.hold_batch.setText(" 停… ")
+            return
+        # 补全永远按全池走, 不受上面的分类/搜索筛选影响 (以前只补当前列表, 看着像没生效)
+        codes = [e["code"] for e in self.analyzer.etfs]
+        if not codes:
+            return
+        self._hold_ok = 0
+        th = HoldBatchThread(codes, str(etf_app.DB))
+        th.tick.connect(self._batch_tick)
+        th.finished_all.connect(self._batch_done)
+        self._hold_thread = th
+        self.hold_batch.setText(" 停止 0/%d " % len(codes))
+        self.hold_note.setText(
+            "开始补全全部 %d 只(池内所有标的, 不管当前筛选)…已有明细的会跳过, "
+            "进度看按钮与状态栏, 可随时再点一次停止。" % len(codes))
+        th.start()
+
+    def _batch_tick(self, i, total, code, n):
+        self.hold_batch.setText(" 停止 %d/%d " % (i, total))
+        self.status.setText("补全持仓 %d/%d · %s %s"
+                            % (i, total, code,
+                               "%d 行" % n if n > 0 else ("无股票明细" if n == 0 else "取数失败")))
+        if i % 10 == 0 or i == total:
+            self.hold_note.setText("补全中 %d/%d …" % (i, total))
+
+    def _batch_done(self, ok, fail):
+        self.hold_batch.setText(" 补全全部 ")
+        self._fill_hold_list()
+        try:
+            n_has = len(etf_hold.cached_codes(str(etf_app.DB)))
+        except Exception:
+            n_has = 0
+        self.hold_note.setText(
+            "补全结束: 本轮有明细 %d 只, 无股票明细/失败 %d 只。"
+            "本地库现有 %d 只可查明细(● 亮色), ○ 灰的是本来就没有股票持仓的"
+            "(货币/债券/黄金/商品/部分跨境/未上市)。" % (ok, fail, n_has))
+        self.status.setText("持仓补全完成 · 本地 %d 只" % n_has)
+
+    def _refresh_inst(self):
+        th = getattr(self, "_inst_thread", None)
+        if th and th.isRunning():
+            self.status.setText("机构/北向还在拉, 稍等")
+            return
+        self._inst_cache = None
+        th = InstThread(str(etf_app.DB))
+        th.tick.connect(lambda s: self.status.setText(s))
+        th.done.connect(self._inst_done)
+        self._inst_thread = th
+        self.hold_inst.setEnabled(False)
+        self.hold_inst.setText(" 拉取中… ")
+        self.hold_note.setText("正在拉机构持仓与陆股通持股, 全市场一次, 约 40 秒…")
+        th.start()
+
+    def _inst_done(self, n1, n2, errs):
+        self.hold_inst.setEnabled(True)
+        self.hold_inst.setText(" 刷新机构 ")
+        self._inst_cache = None
+        date, inst, hs = self._inst_maps()
+        extra = ("异常: " + "; ".join(errs[:2])) if errs else "刚刚更新"
+        self._set_inst_src(date, inst, hs, extra)
+        if self._hold_code:
+            self._load_hold(self._hold_code)     # 先重画表(它会改 hold_note), 再写提示
+        if errs:
+            self.hold_note.setText(
+                "机构/北向部分失败(%s)。已拿到的部分照样写进库里并显示, 可再点一次重试。"
+                % "; ".join(errs[:2]))
+        else:
+            self.hold_note.setText(
+                "机构/北向更新完成: 机构 %d 条、陆股通 %d 只, 报告期 %s。"
+                "表里「北向%%」「社保/险/QFII」两列已按新数据重算。" % (n1, n2, date or "—"))
+        self.status.setText("机构 %d 条 · 陆股通 %d 只%s"
+                            % (n1, n2, (" · 异常: " + "; ".join(errs[:2])) if errs else ""))
+        if self._hold_code:
+            self._load_hold(self._hold_code)
+    # ---- 左表 + 明细渲染
+    def render_index(self):
+        rows = self.idx_groups
+        lt = self.idx_list
+        lt.setRowCount(len(rows))
+        fb = QFont()
+        fb.setBold(True)
+        for i, g in enumerate(rows):
+            it = QTableWidgetItem(g["name"])
+            # 跨境指数用蓝字: 底色仍表示评分状态, 蓝字说明它跟的是隔夜外盘
+            if g["code"] in etf_flow.CROSS_IDX:
+                it.setForeground(QColor(ACCENT))
+            else:
+                it.setForeground(QColor(self.STATE_FG.get(g["state"], TXT)))
+            it.setBackground(QColor(self.STATE_BG.get(g["state"], PANEL2)))
+            it.setFont(fb)
+            lt.setItem(i, 0, it)
+            p = QTableWidgetItem(n0(g["pct"]))
+            p.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            p.setBackground(QColor(self.STATE_BG.get(g["state"], PANEL2)))
+            p.setForeground(color_of(g["pct"]))
+            lt.setItem(i, 1, p)
+            sc = QTableWidgetItem(format(g["score"], ".0f"))
+            sc.setTextAlignment(Qt.AlignCenter)
+            sc.setBackground(QColor(self.STATE_BG.get(g["state"], PANEL2)))
+            sc.setForeground(QColor(self.STATE_FG.get(g["state"], TXT)))
+            sc.setFont(fb)
+            lt.setItem(i, 2, sc)
+        if rows:
+            tot = len(self.analyzer.scores) if self.analyzer else 0
+            na = sum(g["n"] for g in rows if g["code"] not in etf_flow.CROSS_IDX)
+            nq = sum(g["n"] for g in rows if g["code"] in etf_flow.CROSS_IDX)
+            self.idx_rest.setText("上=A股 %d只 · 下=跨境 %d只 · 其余 %d只行业主题不进此表"
+                                  % (na, nq, max(0, tot - na - nq)))
+            sel = 0
+            if self.cur_idx:
+                for i, g in enumerate(rows):
+                    if g["code"] == self.cur_idx.get("code"):
+                        sel = i
+                        break
+            else:
+                want = ["000300", "000001", "000905", "000852", "399006"]
+                sel = max(range(len(rows)), key=lambda i: (rows[i]["n"], rows[i]["score"]))
+                for w0 in want:
+                    hit = [i for i, g in enumerate(rows) if g["code"] == w0 and g["n"] >= 3]
+                    if hit:
+                        sel = hit[0]
+                        break
+            lt.selectRow(sel)
+            self._fill_idx_detail(rows[sel])
+
+    def _on_idx_pick(self, idx):
+        r = idx.row()
+        if 0 <= r < len(self.idx_groups):
+            self._fill_idx_detail(self.idx_groups[r])
+
+    def _on_det_sort(self, col):
+        if not (0 <= col < len(self.det_cols)):
+            return
+        k = self.det_cols[col]
+        if k in ("name", "code"):
+            return
+        if self.det_sort == k:
+            self.det_desc = not self.det_desc
+        else:
+            self.det_sort, self.det_desc = k, True
+        self._render_det()
+
+    def _render_det(self):
+        rows = list(self._det_rows)
+        k = self.det_sort
+        if k:
+            ok = lambda r: isinstance(r.get(k), (int, float)) and r.get(k) == r.get(k)
+            have = [r for r in rows if ok(r)]
+            none = [r for r in rows if not ok(r)]
+            have.sort(key=lambda r: r[k], reverse=self.det_desc)
+            rows = have + none
+        t = self.idx_det
+        t.clearSpans()
+        self._det_view = rows
+        self._det_code = []
+        if not rows:
+            t.setRowCount(1)
+            t.setSpan(0, 0, 1, len(self.det_cols))
+            it = QTableWidgetItem(
+                "该指数旗下没有成交额过 5 亿的场内 ETF，资金只能看指数自身的量价")
+            it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            it.setForeground(QColor(SUB))
+            t.setItem(0, 0, it)
+            t.setFixedHeight(96)
+            return
+        t.setRowCount(len(rows))
+        for i, m in enumerate(rows):
+            t.setItem(i, 0, self._lcell(m["name"]))
+            t.setItem(i, 1, self._lcell(m["code"]))
+            t.setItem(i, 2, color_item(n0(m["pct"]), m["pct"]))
+            t.setItem(i, 3, self._cell("%.1f" % m["amt"] if m["amt"] else "—"))
+            t.setItem(i, 4, color_item(n0(m["mi"]), m["mi"]))
+            t.setItem(i, 5, color_item(n0(m["stg"], 1), m["stg"]))
+            t.setItem(i, 6, color_item(n0(m["mom5"], 0), m["mom5"]))
+            # QDII 的溢价按 T-1 净值估算, 跨时区品种(纳指/日经)里含着昨夜海外涨跌,
+            # 数值天然偏大, 打 * 提醒不能当真实溢价读
+            itp = color_item(n0(m["prem"]), m["prem"])
+            if m.get("qdii"):
+                itp.setText(("⁎" + n0(m["prem"])) if m["prem"] is not None else "—")
+                itp.setToolTip("QDII 溢价 = 现价 / 东财 IOPV − 1。IOPV 是 T-1 净值估算,"
+                               "跨时区品种还含昨夜海外涨跌与汇率变动, 不是真实溢价;"
+                               "要判断限购溢价, 看它相对同类其它 QDII 的高低差。")
+            t.setItem(i, 7, itp)
+            t.setItem(i, 8, self._cell(n0(m["turnover"])))
+            t.setItem(i, 9, self._cell(n0(m["vol_ratio"])))
+            self._det_code.append(m["code"])
+            if getattr(self, "_sel_etf", None) and m["code"] == self._sel_etf:
+                fb = QFont()
+                fb.setBold(True)
+                for j in range(len(self.det_cols)):
+                    it2 = t.item(i, j)
+                    if it2 is not None:
+                        it2.setFont(fb)
+                        it2.setBackground(QColor(PANEL2))
+        for i, txt in enumerate(self.det_hdr):
+            it = t.horizontalHeaderItem(i)
+            if it is not None:
+                it.setText(txt + (" ▼" if self.det_desc else " ▲") if self.det_cols[i] == k else txt)
+        # 行少就收表, 把空间让给上面那张图
+        hgt = len(rows) * 22 + t.horizontalHeader().height() + 8
+        t.setFixedHeight(max(96, min(384, hgt)))
+
+    # ---- 选中指数填充
+    def _fill_idx_detail(self, g):
+        self.cur_idx = g
+        self._sel_etf = None
+        if hasattr(self, "btn_back"):
+            self.btn_back.setVisible(False)
+        pc = g.get("pct")
+        self.flow_title.setText(
+            "<span style='font-size:15px;font-weight:600;'>%s</span>"
+            "<span style='font-size:13px;color:%s;'> %s %s</span>"
+            % (g["name"], UP if (pc or 0) >= 0 else DOWN, n0(g.get("close")),
+               "—" if pc is None else "%+.2f%%" % pc))
+        seg = ["评分 <b>%d</b> %s" % (round(g["score"]), g["state"])]
+        if g.get("ma_dev") is not None:
+            seg.append("MA20 %+.2f%%" % g["ma_dev"])
+        if g.get("pos") is not None:
+            seg.append("20日位置 %.0f" % g["pos"])
+        if g.get("pct5") is not None:
+            seg.append("5日 %+.2f%%" % g["pct5"])
+        self.flow_meta.setText(" · ".join(seg))
+
+        if not g["n"]:
+            self.idx_detail_lbl.setText(
+                "%s · 无 5 亿以上场内 ETF，只展示指数走势与现货量能　"
+                "点列标题可排序" % g["name"])
+        else:
+            self.idx_detail_lbl.setText(
+                "%s · ETF %d 只 · 合计成交 %.1f 亿 · 合计净流入 %s · 占指数成交 %s　"
+                "单击行看单只走势，双击跳 K 线"
+                % (g["name"], g["n"], g["eamt"],
+                   "—" if g["emi"] is None else "%+.2f 亿" % g["emi"],
+                   "—" if g["ratio"] is None else "%.1f%%" % g["ratio"]))
+
+        ms = []
+        for m in g["members"]:
+            d2 = dict(m)
+            d2["stg"] = (m["mi"] / m["amt"] * 100) if (m["mi"] is not None and m["amt"]) else None
+            ms.append(d2)
+        self._det_rows = ms
+        if self.det_sort is None:
+            self.det_sort, self.det_desc = "mi", True
+        self._render_det()
+        self.draw_flow(g)
+        self._fill_note(g)
+
+    def _fut_opt_text(self, g):
+        d = getattr(self, "flow_data", None) or {}
+        fut, opt = d.get("fut") or {}, d.get("opt") or {}
+        p, o = g.get("future"), g.get("option")
+        seg = []
+        f2 = fut.get(p) or {}
+        if f2.get("basis") is not None:
+            seg.append("对应期货 %s 基差 %+.2f%% · 较20日均 %+.2fpp · 持仓 %+.1f%%"
+                       % (p, f2["basis"], f2.get("basis_dev") or 0, f2.get("oi_chg") or 0))
+        allf = ["%s %+.2f%%" % (q, (fut.get(q) or {}).get("basis"))
+                for q in ("IF", "IH", "IC", "IM")
+                if (fut.get(q) or {}).get("basis") is not None]
+        if allf:
+            seg.append("四品种基差 " + " / ".join(allf))
+        o2 = opt.get(o) or {}
+        if o2.get("pcr") is not None:
+            seg.append("对应期权 %s PCR %.2f · 平值IV %.1f%% · 到期 %s"
+                       % (o, o2["pcr"], o2.get("iv") or 0, o2.get("exp_date") or "—"))
+        return "　".join(seg) if seg else "期货/期权无数据"
+
+    def _fill_note(self, g):
+        self.flow_note.setText(self._fut_opt_text(g))
+
+    # ---- 结论条
+    def _flow_ready(self, d):
+        self._flow_busy = False
+        self.btn_flow.setEnabled(True)
+        self.btn_flow.setText(" 刷新数据 ")
+        if not d or not d.get("rows"):
+            self.flow_meta.setText("取数失败: " + " / ".join((d or {}).get("err") or ["未知"]))
+            return
+        self.flow_data = d
+        self.idx_groups = d["rows"]
+        fut_n = sum(1 for v in (d.get("fut") or {}).values() if v.get("basis") is not None)
+        opt_n = sum(1 for v in (d.get("opt") or {}).values() if v.get("pcr") is not None)
+        rows = d["rows"]
+        up = [r for r in rows if r["score"] >= 70]
+        dn = [r for r in rows if r["score"] < 44]
+        div = [r for r in rows if "背离" in r["why"]]
+        seg = ["<b>%s</b>　指数 %d · 期货 %d · 期权 %d%s" % (
+            d.get("date") or "", len(rows), fut_n, opt_n,
+            ("　" + " / ".join(d["err"])) if d.get("err") else "")]
+        if up:
+            seg.append("确认进场 <b>%s</b>" % "、".join(
+                "%s %d" % (r["name"], round(r["score"])) for r in up))
+        if dn:
+            seg.append("仍在撤 %s" % "、".join(
+                "%s %d" % (r["name"], round(r["score"])) for r in dn[:2]))
+        if div:
+            seg.append("<span style='color:%s'>口径打架 %s</span>" % (
+                WARN, "、".join(r["name"] for r in div)))
+        self.flow_concl.setText("　·　".join(seg))
+        self.render_index()
+
+    # ---- 取数
+    def reload_index(self):
+        if not self.analyzer:
+            return
+        if getattr(self, "_flow_busy", False):
+            return
+        self._flow_busy = True
+        self._kl_cache = {}
+        self.btn_flow.setEnabled(False)
+        self.btn_flow.setText(" 取数中… ")
+        self.flow_meta.setText("正在取指数/期货/期权…")
+        th = FlowThread(list(self.analyzer.scores), str(BASE / "etf_tracker.db"))
+        th.done.connect(self._flow_ready)
+        th.done.connect(th.deleteLater)
+        self._flow_thread = th
+        th.start()
+
+    # ---- 图形
+    def _etf_kl(self, code):
+        cache = getattr(self, "_kl_cache", None)
+        if cache is None:
+            cache = self._kl_cache = {}
+        if code in cache:
+            return cache[code]
+        kl = []
+        try:
+            import etf_flow
+            kl = etf_flow.etf_klines(str(BASE / "etf_tracker.db"), [code], 60).get(code) or []
+        except Exception:
+            kl = []
+        cache[code] = kl
+        return kl
+
+    def _on_det_pick(self, idx):
+        """点明细行 -> 上面那张图换成这单只 ETF 自己的资金柱"""
+        r = idx.row()
+        view = getattr(self, "_det_view", [])
+        if not (0 <= r < len(view)):
+            return
+        m = view[r]
+        g = self.cur_idx
+        if not g:
+            return
+        kl = self._etf_kl(m["code"])
+        if not kl:
+            return
+        self._sel_etf = m["code"]
+        self.btn_back.setVisible(True)
+        self._render_det()
+        self.idx_det.selectRow(r)
+        pc = m.get("pct")
+        self.flow_title.setText(
+            "<span style='font-size:12px;color:%s;'>%s ▸ </span>"
+            "<span style='font-size:15px;font-weight:600;'>%s</span>"
+            "<span style='font-size:12px;color:%s;'> %s</span>"
+            "<span style='font-size:13px;color:%s;'> %s %s</span>"
+            % (SUB, g["name"], m["name"], SUB, m["code"],
+               UP if (pc or 0) >= 0 else DOWN, n0(kl[-1][1], 3),
+               "—" if pc is None else "%+.2f%%" % pc))
+        seg = []
+        if m.get("mi") is not None:
+            t0 = "净流入 %+.2f 亿" % m["mi"]
+            if m.get("stg") is not None:
+                t0 += "(强度 %.1f%%)" % m["stg"]
+            seg.append(t0)
+        if m.get("amt"):
+            seg.append("成交 %.1f 亿" % m["amt"])
+        if m.get("mom5") is not None:
+            seg.append("5日动能 %+.1f 亿" % m["mom5"])
+        if m.get("prem") is not None:
+            seg.append("溢价 %+.2f%%" % m["prem"])
+        if m.get("turnover") is not None:
+            seg.append("换手 %.2f%%" % m["turnover"])
+        if m.get("vol_ratio") is not None:
+            seg.append("量比 %.2f" % m["vol_ratio"])
+        self.flow_meta.setText(" · ".join(seg) if seg else "无当日资金明细")
+        self.draw_flow(g, m, kl)
+        self.flow_note.setText(
+            "该ETF 的资金柱为二级市场买卖压力代理，与指数合计口径不同，"
+            "拿单只和合计对照能看出是谁在动　" + self._fut_opt_text(g))
+
+    def _back_to_group(self):
+        if self.cur_idx:
+            self._fill_idx_detail(self.cur_idx)
+
+    def draw_flow(self, g, m=None, kl=None):
+        """m/kl 有值 = 画单只 ETF; 否则画该指数全校 ETF 的合计"""
+        c = self.flow_chart
+        c.fig.clear()
+        one = bool(m and kl)
+        ikl = (g.get("kline") or [])[-38:]
+        mom = dict(((m or {}).get("mom_ser") if one else g.get("mom_ser")) or [])
+        has_flow = bool(mom)
+        # 交易日历可能不同: 纳指/日经比 A 股少一天, 恒生同一天。
+        # 主轴统一取资金动能序列的日期, 指数收盘按日期回填, 否则跨境品种会整条错位、
+        # 资金柱按错位日期取值后全变 0。
+        if has_flow:
+            dates = sorted(mom.keys())[-38:]
+        else:
+            dates = [k[0] for k in (kl if one else ikl)][-38:]
+        if len(dates) < 8:
+            self._flow_ctx = None
+            c.draw()
+            return
+        xs = list(range(len(dates)))
+        src = {k[0]: k[1] for k in ((kl if one else ikl) or [])}
+        close = _ffill([src.get(d) for d in dates])
+        if not close or close[0] is None:
+            self._flow_ctx = None
+            c.draw()
+            return
+        ma = []
+        for i in range(len(close)):
+            seg = close[max(0, i - 19):i + 1]
+            ma.append(sum(seg) / len(seg))
+        if has_flow:
+            gs = c.fig.add_gridspec(2, 1, height_ratios=[1.28, 1], hspace=0.14)
+            ax1 = c.fig.add_subplot(gs[0])
+            ax2 = c.fig.add_subplot(gs[1], sharex=ax1)
+        else:
+            ax1 = c.fig.add_subplot(111)
+            ax2 = None
+        pc = (m.get("pct") if one else g.get("pct")) or 0
+        ax1.plot(xs, close, color=(UP if pc >= 0 else DOWN), lw=1.5, label="收盘")
+        ax1.plot(xs, ma, color=ACCENT, lw=1.0, ls="--", label="MA20")
+        if one:
+            ax1.set_title("%s · %s %s · 近 %d 日" % (g["name"], m["name"], m["code"], len(dates)),
+                          loc="left", fontsize=10, color=TXT)
+            imap = {k[0]: k[1] for k in ikl}
+            iy = _ffill([imap.get(d3) for d3 in dates]) if imap else []
+            px = xs if (iy and iy[0] is not None) else []
+            py = iy if px else []
+            if px:
+                ax1b = ax1.twinx()
+                li, = ax1b.plot(px, py, color=SUB, lw=0.9, alpha=0.6, label="指数(右轴)")
+                ax1b.tick_params(labelsize=7, colors=SUB, pad=1)
+                ax1b.spines["top"].set_visible(False)
+                h1, l1 = ax1.get_legend_handles_labels()
+                ax1.legend(h1 + [li], l1 + ["指数(右轴)"], loc="best",
+                           fontsize=7, frameon=False, ncol=3)
+            else:
+                ax1.legend(loc="lower left", fontsize=7, frameon=False, ncol=2)
+        else:
+            ax1.set_title("%s · 近 %d 日 · 评分 %d %s" % (
+                g["name"], len(dates), round(g["score"]), g["state"]),
+                loc="left", fontsize=10, color=TXT)
+            ax1.legend(loc="lower left", fontsize=7, frameon=False, ncol=2)
+        ax1.grid(alpha=0.22, ls=":")
+        ax1.tick_params(labelbottom=not has_flow, labelsize=7)
+        for sp in ("top", "right"):
+            ax1.spines[sp].set_visible(False)
+
+        if has_flow:
+            vals = [mom.get(d3, 0.0) for d3 in dates]
+            lab = "该ETF 5日资金动能(亿)" if one else "ETF 5日资金动能(亿)"
+            ax2.bar(xs, vals, color=[UP if v >= 0 else DOWN for v in vals],
+                    width=0.72, alpha=0.85, label=lab)
+            ax2.axhline(0, color=GRID, lw=0.8)
+            ax2.grid(alpha=0.2, ls=":")
+            ax2.tick_params(labelsize=7)
+            for sp in ("top", "right"):
+                ax2.spines[sp].set_visible(False)
+            bs = dict(g.get("basis_ser") or {})
+            if bs and not one:
+                ax3 = ax2.twinx()
+                bys = [bs.get(d3) for d3 in dates]
+                px = [x for x, y in zip(xs, bys) if y is not None]
+                py = [y for y in bys if y is not None]
+                l3, = ax3.plot(px, py, color=WARN, lw=1.2, label="期货基差率%(右轴)")
+                ax3.tick_params(labelsize=7, colors=WARN, pad=1)
+                ax3.spines["right"].set_color(WARN)
+                ax3.spines["top"].set_visible(False)
+                h1, l1 = ax2.get_legend_handles_labels()
+                ax2.legend(h1 + [l3], l1 + ["期货基差率%(右轴)"], loc="upper left",
+                           fontsize=7, frameon=False, ncol=2)
+            else:
+                ax2.legend(loc="upper left", fontsize=7, frameon=False)
+            # 最近一次资金方向翻转, 就是图上能看到的进场时点
+            mark = None
+            for i in range(len(vals) - 1, 0, -1):
+                if vals[i - 1] < 0 <= vals[i]:
+                    mark = (i, "资金转正", UP)
+                    break
+            if mark is None:
+                for i in range(len(vals) - 1, 0, -1):
+                    if vals[i - 1] > 0 >= vals[i]:
+                        mark = (i, "资金转负", DOWN)
+                        break
+            if mark:
+                i0, lab2, cl = mark
+                right = i0 > len(dates) * 0.78
+                ax2.axvline(i0, color=cl, lw=0.9, ls="--", alpha=0.75)
+                ax2.annotate(lab2 + " " + dates[i0][5:], xy=(i0, 0),
+                             xytext=(-4 if right else 4, 7), textcoords="offset points",
+                             fontsize=7, color=cl, ha="right" if right else "left",
+                             bbox=dict(facecolor=PANEL, alpha=0.72, edgecolor="none", pad=1.2))
+            step = max(1, len(dates) // 8)
+            ax2.set_xticks(xs[::step])
+            ax2.set_xticklabels([dates[i][5:] for i in xs[::step]], fontsize=7)
+        else:
+            step = max(1, len(dates) // 8)
+            ax1.set_xticks(xs[::step])
+            ax1.set_xticklabels([dates[i][5:] for i in xs[::step]], fontsize=7)
+            ax1.set_xlabel("该指数无 5 亿以上场内 ETF，资金与基差维度缺失", fontsize=7, color=SUB)
+        c.fig.subplots_adjust(left=0.055, right=0.922, top=0.925, bottom=0.115, hspace=0.14)
+        self._flow_ctx = dict(
+            dates=dates, close=close,
+            mom=[mom.get(d, 0.0) for d in dates] if has_flow else None,
+            axs=[ax1] + ([ax2] if ax2 is not None else []),
+            name=(m or {}).get("name") or g.get("name") or "")
+        self._flow_marks = []
+        c.draw()
+
+    def _flow_click(self, ev):
+        """点走势图/资金柱任一处: 竖线定位 + 当日收盘、涨跌、资金动能。"""
+        ctx = getattr(self, "_flow_ctx", None)
+        if not ctx or ev.inaxes is None or ev.xdata is None:
+            return
+        if ev.inaxes not in ctx["axs"]:
+            return
+        i = int(round(ev.xdata))
+        if not (0 <= i < len(ctx["dates"])):
+            return
+        for art in getattr(self, "_flow_marks", []):
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._flow_marks = []
+        ax = ctx["axs"][0]
+        ln = ax.axvline(i, color=ACCENT, lw=0.9, alpha=0.9, zorder=8)
+        close = ctx["close"][i]
+        prev = ctx["close"][i - 1] if i > 0 else close
+        chg = (close / prev - 1) * 100 if (prev and close) else 0.0
+        txt = "%s\n收盘 %s   日涨跌 %+.2f%%" % (
+            ctx["dates"][i], "—" if close is None else "%.3f" % close, chg)
+        if ctx.get("mom"):
+            txt += "\n资金动能 %+.2f 亿" % ctx["mom"][i]
+        right = i > len(ctx["dates"]) * 0.66
+        box = ax.annotate(txt, xy=(i, close if close else 0),
+                          xytext=(-9 if right else 9, 4), textcoords="offset points",
+                          fontsize=7.6, color=TXT, va="top",
+                          ha="right" if right else "left",
+                          bbox=dict(boxstyle="round,pad=0.4", fc=PANEL2, ec=ACCENT,
+                                    lw=0.8, alpha=0.95), zorder=9)
+        self._flow_marks = [ln, box]
+        self.flow_chart.draw()
+        self.status.setText("%s %s · 收 %s · %+.2f%%%s"
+                            % (ctx["name"], ctx["dates"][i],
+                               "—" if close is None else "%.3f" % close, chg,
+                               (" · 动能 %+.2f 亿" % ctx["mom"][i]) if ctx.get("mom") else ""))
+
+    def _on_idx_detail_pick(self, idx):
+        if 0 <= idx.row() < len(self._det_code):
+            self._select_code(self._det_code[idx.row()])
+            self.tabs.setCurrentIndex(1)
+
+    # ---------------- 数据加载 ----------------
+    def _load(self):
+        self.analyzer = Analyzer().load()
+        self._after_load()
+
+    def _after_load(self):
+        a = self.analyzer
+        m = a.meta
+        self.meta_lbl.setText(f"  数据日期 {m['trade_date']} · 更新 {m['fetched_at']} · 覆盖 {m['count']} 只 ")
+        brief = a.daily_brief()
+        pend = [e for e in a.etfs if e["code"] not in a.ind]
+        if pend:
+            cats = sorted({e["category"] for e in pend})
+            brief += ("\n待上市/数据不足 %d 只(已入池): %s · 有连续30个交易日行情后自动纳入评分"
+                      % (len(pend), "、".join(cats)))
+        self.brief_box.setPlainText(brief)
+        self._fill_cats()
+        self._fill_list()
+        self.render_scores()
+        self.draw_kline()
+        self.draw_corr()
+        self.draw_risk()
+        self.draw_rot()
+        self.reload_index()
+        self._fill_hold_list()
+
+    def _fill_cats(self):
+        cats = ["全部"] + sorted({e["category"] for e in self.analyzer.etfs})
+        self.cat_cb.blockSignals(True)
+        self.cat_cb.clear()
+        self.cat_cb.addItems(cats)
+        self.cat_cb.blockSignals(False)
+
+    def shown(self):
+        cat = self.cat_cb.currentText() if self.cat_cb.count() else "全部"
+        if cat == "全部":
+            return self.analyzer.scores
+        return [r for r in self.analyzer.scores if r["cat"] == cat]
+
+    def _fill_list(self):
+        self.etf_list.blockSignals(True)
+        self.etf_list.clear()
+        for r in self.shown():
+            it = QListWidgetItem(f"{r['name']}  {r['pct']:+.2f}%" if r["pct"] is not None
+                                 else r["name"])
+            it.setData(Qt.UserRole, r["code"])
+            it.setForeground(QColor(UP if (r["pct"] or 0) > 0 else DOWN if (r["pct"] or 0) < 0 else TXT))
+            self.etf_list.addItem(it)
+        self.etf_list.blockSignals(False)
+        if self.etf_list.count():
+            self.etf_list.setCurrentRow(0)
+
+    # ---------------- 页1: 评分排名 ----------------
+    @staticmethod
+    def _sort_val(r, key):
+        """取用于排序的值; 返回 None 表示该行无此数据(统一排到最后)。"""
+        if key == "macdSt":
+            s = r.get("macdSt")
+            return None if not s else (1 if s == "多头" else 0)
+        if key in ("name", "cat"):
+            s = str(r.get(key) or "")
+            if not s:
+                return None
+            try:
+                from pypinyin import lazy_pinyin
+                return "".join(lazy_pinyin(s)).lower()
+            except Exception:
+                return s.lower()
+        v = r.get(key)
+        return v if isinstance(v, (int, float)) and v == v else None
+
+    def _sort_rows(self, rows, key, desc):
+        have, none = [], []
+        for r in rows:
+            (have if self._sort_val(r, key) is not None else none).append(r)
+        have.sort(key=lambda r: self._sort_val(r, key), reverse=desc)
+        return have + none
+
+    def _on_sort(self, col):
+        if not (0 <= col < len(self.score_cols)):
+            return
+        key = self.score_cols[col]
+        if key == self._sort_key:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_key = key
+            self._sort_desc = self._sort_def.get(key, True)
+        self.render_scores()
+
+    def _update_header(self):
+        for i, k in enumerate(self.score_cols):
+            base = self._hdr_base[i]
+            if i == 0 and self._sort_key not in ("score", "rank"):
+                base = "原排名"
+            if k == self._sort_key:
+                base += " ▼" if self._sort_desc else " ▲"
+            it = self.score_tbl.horizontalHeaderItem(i)
+            if it is not None:
+                it.setText(base)
+
+    def render_scores(self):
+        rows = self.shown()
+        total = len(rows)
+        kw = self.filter_edit.text().strip() if hasattr(self, "filter_edit") else ""
+        if kw:
+            rows = [r for r in rows
+                    if kw in str(r["code"]) or kw in str(r["name"]) or kw in str(r["cat"])]
+        if hasattr(self, "count_lbl"):
+            self.count_lbl.setText(
+                f"显示 {len(rows)} / {total} 只" + ("（已过滤）" if kw else ""))
+        if self._sort_key:
+            rows = self._sort_rows(rows, self._sort_key, self._sort_desc)
+        self._view_rows = rows
+        t = self.score_tbl
+        t.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            vals = {}
+            for k in self.score_cols:
+                vals[k] = r.get(k)
+            t.setItem(i, 0, self._cell("—" if r.get("rank") is None else str(r["rank"])))
+            nm = self._lcell(r["name"])
+            nm.setToolTip("点名称 → 跳到 K线图")
+            if r.get("no_data"):
+                nm.setToolTip("%s · 上市不足30个交易日, 暂不评分" % (r.get("note") or ""))
+                nm.setForeground(QColor(SUB))
+            t.setItem(i, 1, nm)
+            t.setItem(i, 2, self._cell(r["cat"]))
+            sc = vals["score"]
+            it = QTableWidgetItem("待上市" if sc is None else f"{sc:.1f}")
+            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if sc is None:
+                it.setForeground(QColor(SUB))
+            else:
+                it.setForeground(QColor(UP if sc >= 70 else WARN if sc >= 45 else DOWN))
+            t.setItem(i, 3, it)
+            for j, k in enumerate(["f_mom", "f_trend", "f_flow", "f_risk"], start=4):
+                v = vals[k]
+                it = QTableWidgetItem(f"{v:.0f}" if v is not None else "—")
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                it.setForeground(QColor(UP if (v or 0) >= 70 else DOWN if (v or 0) < 30 else TXT))
+                t.setItem(i, j, it)
+            t.setItem(i, 8, color_item(f"{vals['pct']:+.2f}" if vals["pct"] is not None else "—", vals["pct"]))
+            for j, k, sign in ((9, "mom20", True), (10, "mom60", True), (11, "ytd", True)):
+                v = vals[k]
+                t.setItem(i, j, color_item(f"{v:+.1f}" if v is not None else "—", v))
+            t.setItem(i, 12, self._cell(f"{vals['vol']:.1f}" if vals["vol"] is not None else "—"))
+            t.setItem(i, 13, color_item(f"{vals['sharpe']:.2f}" if vals["sharpe"] is not None else "—", vals["sharpe"]))
+            t.setItem(i, 14, self._cell(f"{vals['mdd']:.1f}" if vals["mdd"] is not None else "—"))
+            mi = vals["main_in"]
+            t.setItem(i, 15, color_item(f"{mi:+,.0f}" if mi is not None else "—", mi))
+            amt = vals.get("amount")
+            t.setItem(i, 16, self._cell(f"{amt/1e4:,.1f}" if amt else "—"))
+            pv = vals["premium"]
+            itp = self._cell(f"{pv:+.2f}" if pv is not None else "—")
+            if pv is not None and looks_qdii(r.get("name")):
+                itp.setText("⁎%+.2f" % pv)
+                itp.setForeground(QColor(WARN))
+                itp.setToolTip("QDII: 现价 / 东财 IOPV(T-1 净值估算) − 1。"
+                               "跨时区品种含着昨夜海外涨跌与汇率, 数值偏大属正常, "
+                               "要判断限购溢价, 比同类 QDII 之间的高低差。")
+            t.setItem(i, 17, itp)
+            t.setItem(i, 18, self._cell(f"{vals['rsi']:.0f}" if vals["rsi"] is not None else "—"))
+            t.setItem(i, 19, self._cell(vals.get("macdSt") or "—"))
+        self._update_header()
+
+    @staticmethod
+    def _cell(text):
+        it = QTableWidgetItem(text)
+        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        return it
+
+    @staticmethod
+    def _lcell(text):
+        it = QTableWidgetItem(str(text))
+        it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        return it
+
+    def _pick_from_score(self, idx):
+        if not (0 <= idx.row() < len(self._view_rows)):
+            return
+        r = self._view_rows[idx.row()]
+        if idx.column() != 1:
+            # 点数字列只是想核对那一格, 一选中就翻页会把表带走; 只做左侧联动
+            self.cur_code = r["code"]
+            self._sync_selection(r["code"])
+            return
+        self._select_code(r["code"])
+        if self.jump_chk.isChecked():
+            self.tabs.setCurrentIndex(1)
+
+    def _on_score_dbl(self, idx):
+        if 0 <= idx.row() < len(self._view_rows):
+            self._select_code(self._view_rows[idx.row()]["code"])
+            self.tabs.setCurrentIndex(1)
+
+    def _pick_from_list(self, cur, _prev=None):
+        if cur:
+            self._select_code(cur.data(Qt.UserRole))
+
+    def _sync_selection(self, code):
+        """两处列表与评分表互相点亮, 免得点了一只却在别处找不到。"""
+        lst = getattr(self, "etf_list", None)
+        if lst is not None and lst.count():
+            lst.blockSignals(True)
+            hit = -1
+            for i in range(lst.count()):
+                if lst.item(i).data(Qt.UserRole) == code:
+                    hit = i
+                    break
+            if hit >= 0:
+                lst.setCurrentRow(hit)
+            lst.blockSignals(False)
+        t = getattr(self, "score_tbl", None)
+        if t is not None:
+            for i, r in enumerate(self._view_rows):
+                if r["code"] == code:
+                    t.blockSignals(True)
+                    t.selectRow(i)
+                    it = t.item(i, 0)
+                    if it is not None:
+                        t.scrollToItem(it)
+                    t.blockSignals(False)
+                    break
+
+    def _select_code(self, code):
+        self.cur_code = code
+        self._sync_selection(code)
+        self.draw_kline()
+
+    # ---------------- 页2: K线 ----------------
+    def draw_kline(self):
+        code = getattr(self, "cur_code", None)
+        if not code:
+            return
+        e = next((x for x in self.analyzer.etfs if x["code"] == code), None)
+        ind = self.analyzer.ind.get(code)
+        if not ind:
+            fig = self.kchart.fig
+            fig.clear()
+            ax = fig.add_subplot(111)
+            ax.axis("off")
+            nm = e["name"] if e else code
+            note = (e.get("note") or "") if e else ""
+            ax.text(0.5, 0.62, nm, ha="center", va="center", fontsize=15, color=TXT)
+            ax.text(0.5, 0.52, "%s  ·  暂无场内 K 线" % code, ha="center", va="center",
+                    fontsize=10, color=SUB)
+            ax.text(0.5, 0.40, "新成立/未上市的基金，交易所还没有连续行情。\n"
+                              "%s\n上市后点「刷新数据」，日K与资金流会自动补上。" % note,
+                    ha="center", va="center", fontsize=9, color=SUB, linespacing=1.7)
+            self.kinfo.setText("  %s (%s) · 待上市" % (nm, code))
+            self._k_ctx = None
+            self.kchart.draw()
+            return
+        d = ind["sum"]
+        self.kinfo.setText(
+            f"  {e['name']} ({code}) · RSI {d['rsi']:.0f} · 20日 {d['r20']:+.1f}% · "
+            f"年内 {d['ytd']:+.1f}% · 距52周高点 {d['offHi']:+.1f}%"
+            if d.get("rsi") is not None else e["name"])
+        fig = self.kchart.fig
+        fig.clear()
+        ax_k = fig.add_axes((0.055, 0.40, 0.92, 0.56))
+        ax_v = fig.add_axes((0.055, 0.26, 0.92, 0.12), sharex=ax_k)
+        ax_s = fig.add_axes((0.055, 0.07, 0.92, 0.16), sharex=ax_k)
+        o, c, h, l, v = ind["o"], ind["c"], ind["h"], ind["l"], ind["v"]
+        n = len(c)
+        x = np.arange(n)
+        colors = np.where(c >= o, UP, DOWN)
+        ax_k.vlines(x, l, h, color=colors, lw=0.7)
+        ax_k.bar(x, np.abs(c - o) + 1e-9, 0.65, bottom=np.minimum(o, c),
+                 color=colors, zorder=3)
+        for arr, colr, lab in ((ind["ma5"], "#f5a623", "MA5"), (ind["ma20"], ACCENT, "MA20"),
+                               (ind["ma60"], "#9b59b6", "MA60")):
+            ax_k.plot(x, arr, lw=1, color=colr, label=lab)
+        ax_k.plot(x, ind["boll_up"], lw=0.8, ls="--", color="#5a6070", label="BOLL上")
+        ax_k.plot(x, ind["boll_low"], lw=0.8, ls="--", color="#5a6070", label="BOLL下")
+        ax_k.legend(loc="upper left", fontsize=8, ncol=5, frameon=False)
+        ax_k.set_title(f"{e['name']} ({code})  日K · {n}个交易日", loc="left", fontsize=11)
+        ax_k.grid(color=GRID, lw=0.5)
+        ax_k.tick_params(labelbottom=False)
+        ax_v.bar(x, v, color=colors, width=0.65)
+        ax_v.set_ylabel("成交量", fontsize=8)
+        ax_v.tick_params(labelbottom=False)
+        ax = ax_s
+        mode = self.sub_mode.currentText()
+        if mode == "MACD":
+            ax.bar(x, ind["hist"], color=np.where(ind["hist"] >= 0, UP, DOWN), width=0.65)
+            ax.plot(x, ind["dif"], lw=1, color="#f5a623", label="DIF")
+            ax.plot(x, ind["dea"], lw=1, color=ACCENT, label="DEA")
+        elif mode == "RSI":
+            ax.plot(x, ind["rsi"], lw=1.1, color="#9b59b6")
+            ax.axhline(70, color=UP, ls="--", lw=0.7)
+            ax.axhline(30, color=DOWN, ls="--", lw=0.7)
+            ax.set_ylim(0, 100)
+            ax.set_ylabel("RSI14", fontsize=8)
+        else:
+            ax.plot(x, ind["K"], lw=1, color="#f5a623", label="K")
+            ax.plot(x, ind["D"], lw=1, color=ACCENT, label="D")
+            ax.plot(x, ind["J"], lw=1, color="#9b59b6", label="J")
+            ax.legend(loc="upper left", fontsize=8, ncol=3, frameon=False)
+            ax.set_ylabel("KDJ", fontsize=8)
+        if mode == "MACD":
+            ax.legend(loc="upper left", fontsize=8, ncol=2, frameon=False)
+            ax.set_ylabel("MACD", fontsize=8)
+        ax.grid(color=GRID, lw=0.5)
+        step = max(1, n // 10)
+        ticks = list(range(0, n, step))
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([ind["dates"][i] for i in ticks], fontsize=7)
+        for a_ in (ax_k, ax_v, ax):
+            a_.set_xlim(-1, n)
+        self._k_ctx = dict(dates=ind["dates"], o=o, c=c, h=h, l=l, v=v, n=n,
+                           ax=ax_k, axs=(ax_k, ax_v, ax), code=code, name=e["name"],
+                           ma5=ind["ma5"], ma20=ind["ma20"], ma60=ind["ma60"])
+        self._k_marks = []
+        self.kchart.draw()
+
+    def _kline_click(self, ev):
+        """点 K 线任意位置: 竖线定位 + 当日开高低收/涨跌/量/均线数值。"""
+        ctx = getattr(self, "_k_ctx", None)
+        if not ctx or ev.inaxes is None or ev.xdata is None:
+            return
+        if ev.inaxes not in ctx["axs"]:
+            return
+        i = int(round(ev.xdata))
+        if not (0 <= i < ctx["n"]):
+            return
+        for art in getattr(self, "_k_marks", []):
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._k_marks = []
+        ax = ctx["ax"]
+        ln = ax.axvline(i, color=ACCENT, lw=0.9, alpha=0.9, zorder=8)
+
+        def _ma(arr):
+            try:
+                val = float(arr[i])
+            except Exception:
+                return "—"
+            return "—" if val != val else "%.2f" % val
+
+        prev = ctx["c"][i - 1] if i > 0 else ctx["o"][i]
+        chg = (ctx["c"][i] / prev - 1) * 100 if prev else 0.0
+        txt = ("%s\n开 %.3f  高 %.3f  低 %.3f  收 %.3f\n涨跌 %+.2f%%   量 %.0f\nMA5 %s  MA20 %s  MA60 %s"
+               % (ctx["dates"][i], ctx["o"][i], ctx["h"][i], ctx["l"][i], ctx["c"][i],
+                  chg, ctx["v"][i], _ma(ctx["ma5"]), _ma(ctx["ma20"]), _ma(ctx["ma60"])))
+        # 越靠右的柱子, 框子摆到左边, 免得跑出画布
+        right = i > ctx["n"] * 0.66
+        box = ax.annotate(txt, xy=(i, ctx["h"][i]),
+                          xytext=(-10 if right else 10, 4), textcoords="offset points",
+                          fontsize=7.8, color=TXT, va="top", ha="right" if right else "left",
+                          bbox=dict(boxstyle="round,pad=0.42", fc=PANEL2, ec=ACCENT,
+                                    lw=0.8, alpha=0.96), zorder=9)
+        self._k_marks = [ln, box]
+        self.kchart.draw()
+        self.status.setText("%s %s · 收 %.3f (%+.2f%%) · 量 %.0f"
+                            % (ctx["code"], ctx["dates"][i], ctx["c"][i], chg, ctx["v"][i]))
+
+    # ---------------- 页3: 相关性 ----------------
+    @staticmethod
+    def _cluster_order(m):
+        """贪心聚拢: 从平均相关最高的那只出发, 每次接上跟当前最同步的一只,
+        同风险源的标的会连成块, 矩阵看得出一团一团。"""
+        n = len(m)
+        mm = np.where(np.isfinite(m), m, -1.0).astype(float)
+        np.fill_diagonal(mm, -9.0)
+        avg = mm.mean(axis=1)
+        order = [int(np.argmax(avg))]
+        used = [False] * n
+        used[order[0]] = True
+        while len(order) < n:
+            last = order[-1]
+            bi, best = -1, -9.0
+            for j in range(n):
+                if used[j]:
+                    continue
+                if mm[last, j] > best:
+                    best, bi = mm[last, j], j
+            order.append(bi)
+            used[bi] = True
+        return order
+
+    # ---- 点矩阵格子 / 配对表 → 出这两只的对比图
+    def _corr_click(self, ev):
+        ctx = self._corr_ctx
+        if not ctx or ev.xdata is None or ev.ydata is None:
+            return
+        if ev.inaxes is not ctx.get("ax"):
+            return
+        i, j = int(round(ev.ydata)), int(round(ev.xdata))
+        n = len(ctx["names"])
+        if not (0 <= i < n and 0 <= j < n) or i == j:
+            return
+        self._corr_pair = (i, j) if i < j else (j, i)
+        self.draw_corr()
+        self.status.setText("%s vs %s · 近 %s 日相关 %.3f"
+                            % (ctx["names"][j], ctx["names"][i], ctx["days"],
+                               ctx["m"][i, j]))
+
+    def _corr_hover(self, ev):
+        """鼠标停在哪一格, 状态栏就报那两只的名字与相关系数。"""
+        ctx = self._corr_ctx
+        if not ctx or ev.inaxes is not ctx.get("ax") or ev.xdata is None or ev.ydata is None:
+            return
+        i, j = int(round(ev.ydata)), int(round(ev.xdata))
+        n = len(ctx["names"])
+        if not (0 <= i < n and 0 <= j < n):
+            return
+        self.status.setText("%s vs %s · 近 %s 日相关 %.3f"
+                            % (ctx["names"][j], ctx["names"][i], ctx["days"],
+                               ctx["m"][i, j]))
+
+    def _on_corr_pair_pick(self, idx):
+        ctx = self._corr_ctx
+        if not ctx or not (0 <= idx.row() < len(self._corr_show)):
+            return
+        ca, cb_ = self._corr_show[idx.row()]
+        codes = ctx["codes"]
+        if ca in codes and cb_ in codes:
+            i, j = codes.index(ca), codes.index(cb_)
+            self._corr_pair = (i, j) if i < j else (j, i)
+            self.draw_corr()
+
+    def _corr_filter_later(self):
+        """搜索框每敲一个字就重建一万行会卡, 停顿一下再建。"""
+        self._corr_filter.start()
+
+    def _corr_sort_by(self, col):
+        if not (0 <= col <= 3):
+            return
+        old_col, old_desc = self._corr_sort
+        desc = not old_desc if col == old_col else (col == 3)
+        self._corr_sort = (col, desc)
+        self.corr_pairs.horizontalHeader().setSortIndicator(
+            col, Qt.DescendingOrder if desc else Qt.AscendingOrder)
+        self._fill_corr_pairs()
+
+    def _fill_corr_pairs(self):
+        """配对清单: 前40/各40 仍只列极端对; 「全部配对」把 n(n-1)/2 对全列出来。"""
+        t = self.corr_pairs
+        pairs = getattr(self, "_corr_pairs_all", []) or []
+        if not pairs:
+            t.setRowCount(0)
+            self._corr_show = []
+            self.corr_pair_lbl.setText("配对清单 · 先选范围重算")
+            return
+        mode = self.corr_pair_mode.currentText()
+        n = len(self._corr_names_all)
+        tot = n * (n - 1) // 2
+        if mode.startswith("同涨+分散"):
+            top = pairs[:40]
+            bot = sorted(pairs, key=lambda x: x[0])[:40]
+            show = [("同涨", an, bn, v, ac, bc) for v, an, bn, ac, bc in top]
+            show += [("分散", an, bn, v, ac, bc) for v, an, bn, ac, bc in bot]
+        elif mode.startswith("分散"):
+            show = [("分散", an, bn, v, ac, bc)
+                    for v, an, bn, ac, bc in sorted(pairs, key=lambda x: x[0])[:40]]
+        elif mode.startswith("全部"):
+            show = [(("同涨" if v >= 0.9 else "分散" if v < 0.6 else "中性"),
+                     an, bn, v, ac, bc) for v, an, bn, ac, bc in pairs]
+        else:
+            show = [("同涨", an, bn, v, ac, bc) for v, an, bn, ac, bc in pairs[:40]]
+        kw = self.corr_pair_search.text().strip().upper()
+        if kw:
+            show = [p for p in show
+                    if kw in p[1].upper() or kw in p[2].upper()
+                    or kw in str(p[4]) or kw in str(p[5])]
+        col, desc = getattr(self, "_corr_sort", (3, True))
+        def _k(p):
+            if col == 0:
+                return "0" if p[0] == "同涨" else "1" if p[0] == "分散" else "2"
+            if col == 1:
+                return p[1]
+            if col == 2:
+                return p[2]
+            return p[3]
+        show.sort(key=_k, reverse=desc)
+        self._corr_show = [(p[4], p[5]) for p in show]
+        shown = "全部列出" if mode.startswith("全部") and not kw and len(show) == tot else (
+            "筛出 %d 对" % len(show) if kw else "列 %d 行" % len(show))
+        self.corr_pair_lbl.setText("%d 只 · 共 %d 对 · %s · 点列头排序"
+                                   % (n, tot, shown))
+        t.setSortingEnabled(False)
+        t.setRowCount(len(show))
+        for r, (rel, an, bn, v, ac, bc) in enumerate(show):
+            it0 = QTableWidgetItem(rel)
+            it0.setTextAlignment(Qt.AlignCenter)
+            it0.setForeground(QColor(UP if rel == "同涨" else DOWN if rel == "分散" else SUB))
+            t.setItem(r, 0, it0)
+            ia = QTableWidgetItem(short_name(an, 8))
+            ia.setToolTip("%s %s · 点这行看对比图" % (ac, an))
+            t.setItem(r, 1, ia)
+            ib = QTableWidgetItem(short_name(bn, 8))
+            ib.setToolTip("%s %s" % (bc, bn))
+            t.setItem(r, 2, ib)
+            it = QTableWidgetItem("%.2f" % v)
+            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            it.setForeground(QColor(UP if v >= 0.9 else DOWN if v < 0.6 else TXT))
+            t.setItem(r, 3, it)
+        t.scrollToTop()
+
+    def draw_corr(self):
+        days = int(self.corr_days.currentText())
+        scope = self.corr_scope.currentText()
+        names, codes, m, info = self._corr_subset(scope, days)
+        self._corr_part = list(zip(codes, names))
+        fig = self.corr_chart.fig
+        fig.clear()
+        self.corr_pairs.setRowCount(0)
+        self._corr_show = []
+        if m is None or len(names) < 2:
+            self._corr_ctx = None
+            self.corr_cnt.setText("参与计算 0 只 · %s" % (info.get("why") or "样本不足"))
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "样本不足", ha="center", va="center", color=SUB,
+                    transform=ax.transAxes)
+            self.corr_chart.draw()
+            return
+        txt = "参与计算 <b>%d</b> 只 / 池 %d 只" % (len(names), info["pool"])
+        if info["short"]:
+            txt += "<br>%d 只K线不足 %d 日已跳过" % (info["short"], days)
+        if info["unlisted"]:
+            txt += "<br>%d 只未上市无K线" % info["unlisted"]
+        self.corr_cnt.setText(txt)
+        self.corr_cnt.setTextFormat(Qt.RichText)
+        # 配对表(先存全部配对, 再按模式取子集; 排序在矩阵聚簇之前做)
+        pairs = []
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                v = m[i, j]
+                if v == v:
+                    pairs.append((float(v), names[i], names[j], codes[i], codes[j]))
+        pairs.sort(key=lambda x: -x[0])
+        self._corr_pairs_all = pairs
+        self._corr_names_all = list(names)
+        self._fill_corr_pairs()
+
+        order = self._cluster_order(m)
+        names2 = [names[i] for i in order]
+        codes2 = [codes[i] for i in order]
+        m2 = m[np.ix_(order, order)]
+        n = len(names2)
+        pair = self._corr_pair
+        if pair and (pair[0] >= n or pair[1] >= n):
+            pair = self._corr_pair = None
+        self._corr_ctx = dict(names=names2, codes=codes2, m=m2, days=days, ax=None)
+
+        if pair:
+            gs = fig.add_gridspec(2, 1, height_ratios=[1.85, 1.05],
+                                  left=0.148, right=0.895, top=0.952, bottom=0.072,
+                                  hspace=0.16)
+            ax = fig.add_subplot(gs[0])
+            has_xtick = False
+        else:
+            # 标的很多时横轴标签挤不下, 干脆不标, 省出来的高度给矩阵
+            bottom = 0.19 if n <= 60 else 0.095
+            ax = fig.add_axes((0.135, bottom, 0.775, 0.935 - bottom))
+            has_xtick = n <= 60
+        self._corr_ctx["ax"] = ax
+        from matplotlib.colors import LinearSegmentedColormap
+        cmap = LinearSegmentedColormap.from_list("rg", [DOWN, "#232834", UP])
+        # 有下方配对图或标的很多时, 保持正方格会留大片空白, 让它填满
+        im = ax.imshow(m2, cmap=cmap, vmin=-1, vmax=1,
+                       aspect="auto" if (pair or n > 48) else None)
+        # 分类分隔线只在块真的连续时才有意义, 聚簇后同分类未必相邻, 因此不画
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        fs = 6.6 if n <= 26 else 5.8 if n <= 36 else 5.0
+        # n 大时全标会糊成黑带, 每 k 个标一次; 名字仍然都算得出来(点格子看标题)
+        step = 1 if n <= 48 else int(np.ceil(n / 40))
+        if has_xtick:
+            ax.set_xticklabels([short_name(x, 7) if i % step == 0 else ""
+                                for i, x in enumerate(names2)],
+                               rotation=90, fontsize=fs)
+        else:
+            ax.set_xticklabels([])
+            ax.tick_params(axis="x", length=0)
+            fs = fs + 0.6
+        ax.set_yticklabels([short_name(x, 9) if i % step == 0 else ""
+                            for i, x in enumerate(names2)], fontsize=fs)
+        if n <= 22:
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    ax.text(j, i, "%.2f" % m2[i, j], ha="center", va="center",
+                            fontsize=5.4, color=("#ffffff" if abs(m2[i, j]) > 0.7 else SUB))
+        # 选中: 两格描边 + 贯穿的十字线(155 只时那两格只有几个像素, 不画线根本找不到)
+        if pair:
+            i, j = pair
+            for (a_, b_) in ((i, j), (j, i)):
+                ax.add_patch(Rectangle((b_ - 0.5, a_ - 0.5), 1, 1, fill=False,
+                                       edgecolor=ACCENT, lw=2.0, zorder=6))
+            for idx in (i, j):
+                ax.axhline(idx + 0.5, color=ACCENT, lw=1.0, alpha=0.85, zorder=7)
+                ax.axvline(idx + 0.5, color=ACCENT, lw=1.0, alpha=0.85, zorder=7)
+        title = (f"日收益率相关性 · 近{days}日 · n={n} · 行序按相似度聚拢, 色块成团=同一风险源"
+                 if not pair else
+                 f"日收益率相关性 · 近{days}日 · n={n} · 已选: "
+                 f"{short_name(names2[pair[0]], 10)} vs {short_name(names2[pair[1]], 10)} "
+                 f"= {m2[pair[0], pair[1]]:.2f}")
+        ax.set_title(title, loc="left", fontsize=10)
+        cb = fig.colorbar(im, fraction=0.03, pad=0.02)
+        cb.ax.tick_params(labelsize=7, colors=SUB)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        if pair:
+            self._draw_corr_pair(fig, gs, pair, names2, codes2, m2, days)
+        self.corr_chart.draw()
+
+    def _draw_corr_pair(self, fig, gs, pair, names2, codes2, m2, days):
+        """两只标的: 归一走势(左轴) + 滚动20日相关(右轴)。"""
+        a = self.analyzer
+        ax = fig.add_subplot(gs[1])
+        i, j = pair
+        ca, cb_ = codes2[i], codes2[j]
+        ser = []
+        for code in (ca, cb_):
+            k = (a.kline.get(code) or [])[-(days + 1):]
+            if len(k) < 8:
+                return
+            ser.append([(r[0], float(r[2])) for r in k if r[2]])
+        d0 = {d for d, _ in ser[0]}
+        common = [d for d, _ in ser[1] if d in d0]
+        if len(common) < 8:
+            return
+        N1 = {d: v for d, v in ser[0]}
+        N2 = {d: v for d, v in ser[1]}
+        x = list(range(len(common)))
+        y1 = np.array([N1[d] for d in common], float)
+        y2 = np.array([N2[d] for d in common], float)
+        y1 = y1 / y1[0] * 100
+        y2 = y2 / y2[0] * 100
+        ax.plot(x, y1, color=UP, lw=1.35, label=short_name(names2[i], 10))
+        ax.plot(x, y2, color=ACCENT, lw=1.35, label=short_name(names2[j], 10))
+        ax.axhline(100, color=SUB, lw=0.6, ls=":")
+        ax.set_ylabel("归一=100", fontsize=7.5)
+        ax.tick_params(labelsize=7)
+        ax.grid(color=GRID, lw=0.5)
+        step = max(1, len(common) // 8)
+        ax.set_xticks(list(range(0, len(common), step)))
+        ax.set_xticklabels([common[k][5:] for k in range(0, len(common), step)], fontsize=6.5)
+        ax.set_xlim(-1, len(common))
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        ax.legend(loc="upper left", fontsize=7, frameon=False, ncol=2, handlelength=1.2)
+        # 滚动 20 日相关
+        best = float(m2[i, j])
+        ax2 = ax.twinx()
+        w = 20
+        if len(common) > w + 2:
+            r1 = np.diff(y1) / y1[:-1]
+            r2 = np.diff(y2) / y2[:-1]
+            roll = []
+            for t in range(w, len(r1) + 1):
+                s1, s2 = r1[t - w:t], r2[t - w:t]
+                c = np.corrcoef(s1, s2)[0, 1] if s1.std() > 0 and s2.std() > 0 else np.nan
+                roll.append(c)
+            xs = list(range(w, w + len(roll)))
+            ax2.plot(xs, roll, color=WARN, lw=1.0, ls="--", alpha=0.9,
+                     label="滚动20日相关")
+            ax2.axhline(best, color=SUB, lw=0.7, ls=":")
+            ax2.set_ylim(-1.05, 1.05)
+            ax2.set_ylabel("滚动相关", fontsize=7, color=WARN)
+            ax2.tick_params(labelsize=6.5, colors=WARN)
+            ax2.legend(loc="lower right", fontsize=6.6, frameon=False)
+            for sp in ("top", "left"):
+                ax2.spines[sp].set_visible(False)
+            ax.set_title("归一走势(今日=100) · 虚线=滚动20日相关(右轴) · 区间相关 %.2f"
+                         % best, loc="left", fontsize=8.6, pad=3)
+        else:
+            ax.set_title("归一走势(起点=100) · 区间相关 %.2f" % best,
+                         loc="left", fontsize=8.6, pad=3)
+
+    def _corr_subset(self, scope, days):
+        a = self.analyzer
+        codes = [e["code"] for e in a.etfs]
+        names_all = [e["name"] for e in a.etfs]
+        if scope.startswith("成交额前"):
+            topn = int(scope.replace("成交额前", "").strip() or 25)
+            ranked = sorted(range(len(a.etfs)),
+                            key=lambda i: -(((a.snaps.get(codes[i]) or {}).get("amount")) or 0))
+            keep = ranked[:topn]
+        elif scope.startswith("各分类"):
+            # 每个分类里成交额最大的那只, 避免同指数重复把矩阵刷成一片红
+            best = {}
+            for i, e in enumerate(a.etfs):
+                amt = (a.snaps.get(codes[i]) or {}).get("amount") or 0
+                cat = e["category"]
+                if cat not in best or amt > best[cat][0]:
+                    best[cat] = (amt, i)
+            keep = [i for _, i in sorted(best.values(), key=lambda x: -x[0])]
+        elif scope.startswith("当前分类"):
+            cat = self.cat_cb.currentText()
+            if cat != "全部":
+                keep = [i for i, e in enumerate(a.etfs) if e["category"] == cat]
+            else:
+                keep = list(range(len(a.etfs)))
+        elif scope.startswith("评分前20"):
+            keep = [next(i for i, e in enumerate(a.etfs) if e["code"] == r["code"])
+                    for r in a.scores[:20]]
+        else:
+            keep = list(range(len(a.etfs)))
+        series, names, keep_codes = [], [], []
+        short = 0
+        for i in keep:
+            k = a.kline.get(codes[i]) or []
+            if len(k) > days:
+                c = np.array([x[2] for x in k][-days-1:], float)
+                series.append(np.diff(c) / c[:-1])
+                names.append(names_all[i])
+                keep_codes.append(codes[i])
+            elif k:
+                short += 1
+        info = dict(pool=len(a.etfs), sel=len(keep), short=short,
+                    unlisted=sum(1 for e in a.etfs if not a.kline.get(e["code"])),
+                    why="池内 %d 只, 选中范围内 %d 只, 可用样本 %d 只"
+                        % (len(a.etfs), len(keep), len(series)))
+        if len(series) < 2:
+            return names, keep_codes, None, info
+        return names, keep_codes, np.corrcoef(np.array(series)), info
+
+    # ---------------- 页4: 风险收益 ----------------
+    def draw_risk(self):
+        a = self.analyzer
+        wlab = self.risk_win.currentText()
+        w = int(wlab.replace("今日", "1").replace("日", ""))
+        mode = self.risk_scope.currentText()
+        pts = a.risk_pts(w)
+        if mode.startswith("成交额前"):
+            topn = int(mode.replace("成交额前", "").strip() or 40)
+            keep = {r["code"] for r in sorted(pts, key=lambda r: -r["amount"])[:topn]}
+            pts = [r for r in pts if r["code"] in keep]
+        elif mode == "当前分类":
+            keep = {r["code"] for r in self.shown()}
+            pts = [r for r in pts if r["code"] in keep]
+        pts = [r for r in pts if r["amp"] is not None]
+        fig = self.risk_chart.fig
+        fig.clear()
+        self._risk_all = pts
+        ax = fig.add_subplot(111)
+        self._risk_ax = ax
+        if not pts:
+            ax.text(0.5, 0.5, "样本不足", ha="center", va="center", color=SUB,
+                    transform=ax.transAxes)
+            self._risk_ax = None
+            self.risk_tbl.setRowCount(0)
+            self._risk_pts = []
+            self._risk_ranked = []
+            self.risk_cnt.setText("样本不足, 该区间没有可比的标的")
+            self.risk_chart.draw()
+            return
+        xv = np.array([p["amp"] for p in pts], float)
+        yv = np.array([p["ret"] for p in pts], float)
+        amt = np.array([p["amount"] or 0 for p in pts], float)
+        rat = np.array([p["ratio"] if p["ratio"] is not None else 0 for p in pts], float)
+        sizes = 22 + 380 * np.sqrt(amt / max(amt.max(), 1e-9))
+        from matplotlib.colors import LinearSegmentedColormap
+        cmap = LinearSegmentedColormap.from_list("rg", [DOWN, "#e6a23c", UP])
+        sc = ax.scatter(xv, yv, s=sizes, c=np.clip(rat, -2, 2), cmap=cmap,
+                        vmin=-2, vmax=2, alpha=0.85,
+                        edgecolors=GRID, linewidths=0.7, zorder=3)
+        cb = fig.colorbar(sc, ax=ax, fraction=0.028, pad=0.012)
+        cb.set_label("收益 ÷ 波动", fontsize=8)
+        cb.ax.tick_params(labelsize=7, colors=SUB)
+        cb.outline.set_visible(False)
+
+        x0, x1 = float(xv.min()), float(xv.max())
+        y0, y1 = float(yv.min()), float(yv.max())
+        px = max((x1 - x0) * 0.08, 0.12)
+        py = max((y1 - y0) * 0.10, 0.35)
+        ax.axhline(0, color=SUB, lw=0.9, zorder=2)
+        ax.axvline(float(xv.mean()), color=SUB, ls="--", lw=0.8, zorder=2)
+        ax.axhline(float(yv.mean()), color=SUB, ls="--", lw=0.8, zorder=2)
+        ax.text(float(xv.mean()), y0 - py * 0.72, " 均值波动 %.2f%%" % xv.mean(),
+                fontsize=7, color=SUB, va="bottom")
+        ax.text(x0 - px * 0.1, y1 + py * 0.5, "左上: 涨得多 · 抖得少", fontsize=8.2,
+                color=ACCENT, va="top", ha="left")
+        ax.text(x1 + px * 0.1, y0 - py * 0.4, "右下: 又抖又亏", fontsize=8.2,
+                color=WARN, ha="right", va="bottom")
+
+        # 默认标两端(前10/后5) + 选中项, 中间那堆靠点选看, 免得名字叠成一团
+        order = np.argsort(-rat)
+        pick = list(order[:10]) + list(order[-5:])
+        sel = self._risk_sel
+        placed = []
+        for rank_i, i in enumerate(pick):
+            if sel and pts[i]["code"] == sel:
+                continue
+            r = pts[i]
+            try:
+                dx, dy = ax.transData.transform((xv[i], yv[i]))
+            except Exception:
+                dx = dy = 0
+            # 前 5 个必标, 其余跟已标过的靠太近就跳过, 免得左上角糊成一团
+            if rank_i >= 5 and any((dx - ox) ** 2 + (dy - oy) ** 2 < 2100
+                                   for ox, oy in placed):
+                continue
+            placed.append((dx, dy))
+            ax.annotate(short_name(r["name"], 9), (xv[i], yv[i]), fontsize=6.4,
+                        color=TXT, xytext=(6, 5), textcoords="offset points",
+                        alpha=0.95,
+                        bbox=dict(boxstyle="round,pad=0.12", fc=BG, ec="none", alpha=0.72))
+        if sel:
+            hit = next((i for i, p in enumerate(pts) if p["code"] == sel), None)
+            if hit is not None:
+                ax.scatter([xv[hit]], [yv[hit]], s=[sizes[hit] + 130], facecolors="none",
+                           edgecolors=ACCENT, linewidths=1.6, zorder=5)
+                r = pts[hit]
+                ax.annotate("%s \n%s %+.2f%%  波动%.2f%%  比值%s"
+                            % (r["name"][:14], wlab, r["ret"], r["amp"], n0(r["ratio"], 2)),
+                            (xv[hit], yv[hit]), fontsize=7.4, color=TXT,
+                            xytext=(10, -16), textcoords="offset points", zorder=6,
+                            bbox=dict(boxstyle="round,pad=0.28", fc=PANEL2, ec=ACCENT,
+                                      alpha=0.95))
+                self.risk_sel_lbl.setText(
+                    "%s (%s)\n%s %+.2f%% · 波动 %.2f%% · 收益/波动 %s"
+                    % (r["name"], r["code"], wlab, r["ret"], r["amp"], n0(r["ratio"], 2)))
+        ax.set_xlim(x0 - px, x1 + px)
+        ax.set_ylim(y0 - py, y1 + py)
+        ax.set_xlabel("区间波动幅度 %% (%s, 日收益标准差×√天数)" % wlab)
+        ax.set_ylabel("区间涨跌 %% (%s)" % wlab)
+        ax.set_title("风险收益散点 · n=%d · 颜色=区间收益÷区间波动(≥1 才没白担风险) · 点圆点看名 · 双击跳K线" % len(pts),
+                     loc="left", fontsize=11)
+        ax.grid(color=GRID, lw=0.5, zorder=1)
+        self._risk_data = (xv, yv)
+        self._risk_sync_xy()
+        self.risk_chart.draw()
+
+        # 榜单: 参与散点的全部标的, 点列头可换排序
+        self._risk_ranked = [p for p in pts if p["ratio"] is not None]
+        self.risk_cnt.setText(
+            "共 %d 只（散点里的全部）· 点列头换排序 · 点行在图上定位" % len(self._risk_ranked))
+        self._render_risk_tbl()
+
+    def _on_risk_sort(self, col):
+        keymap = {0: "name", 1: "code", 2: "cat", 3: "ret", 4: "amp", 5: "ratio"}
+        key = keymap.get(col)
+        if not key:
+            return
+        old, desc = self._risk_sort
+        self._risk_sort = (col, (not desc) if old == col else key not in ("name", "code", "cat"))
+        self._render_risk_tbl()
+
+    def _render_risk_tbl(self):
+        col, desc = self._risk_sort
+        keymap = {0: "name", 1: "code", 2: "cat", 3: "ret", 4: "amp", 5: "ratio"}
+        key = keymap.get(col, "ratio")
+        rows = sorted(self._risk_ranked,
+                      key=lambda p: (p.get(key) is None, p.get(key) if p.get(key) is not None
+                                     else 0), reverse=desc)
+        self._risk_pts = rows
+        t = self.risk_tbl
+        t.blockSignals(True)
+        pos = t.verticalScrollBar().value()
+        t.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            nm = self._lcell(r["name"])
+            nm.setToolTip("%s · %s\n区间 %+.2f%% · 波动 %.2f%% · 收益/波动 %s"
+                          % (r["name"], r.get("cat") or "", r["ret"], r["amp"] or 0,
+                             n0(r["ratio"], 2)))
+            if r["code"] == self._risk_sel:
+                nm.setForeground(QColor(ACCENT))
+            t.setItem(i, 0, nm)
+            ic = self._lcell(r["code"])
+            ic.setForeground(QColor(SUB))
+            t.setItem(i, 1, ic)
+            ca = self._lcell(r.get("cat") or "—")
+            ca.setForeground(QColor(SUB))
+            t.setItem(i, 2, ca)
+            t.setItem(i, 3, color_item("%+.2f" % r["ret"], r["ret"]))
+            t.setItem(i, 4, self._cell("%.2f" % (r["amp"] or 0)))
+            it = QTableWidgetItem(n0(r["ratio"], 2))
+            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            v = r["ratio"] or 0
+            it.setForeground(QColor(UP if v >= 1 else WARN if v >= 0 else DOWN))
+            t.setItem(i, 5, it)
+        if self._risk_sel:
+            for i, r in enumerate(rows):
+                if r["code"] == self._risk_sel:
+                    t.selectRow(i)
+                    break
+        t.blockSignals(False)
+        t.verticalScrollBar().setValue(pos)
+
+    # ---------------- 页5: 轮动 ----------------
+    def draw_rot(self):
+        rot = self.analyzer.rot if self.analyzer else None
+        if not rot:
+            self.rot_concl.setText("样本不足, 无法计算轮动")
+            self.rot_tbl.setRowCount(0)
+            return
+        w = self.rot_w
+        rows = self._rot_rows(w)
+        self.rot_view = rows
+        self._render_rot_table(rows, w)
+        hl = getattr(self, "rot_hl", None)
+        self._draw_rot_bars(rows, w, hl=hl)
+        lab = self.analyzer.rot_label(w)
+        head = "%s　%d 个板块 · %s动量（成分等权）" % (
+            self.analyzer.meta.get("trade_date") or "", len(rot["cats"]), lab)
+        if w == 20:
+            notes = rot.get("notes") or []
+        else:
+            notes = self.analyzer._rot_notes(rot["cats"], rot["cur_by_w"][w],
+                                             rot["rank_by_w"][w], rot["chg_by_w"][w],
+                                             rot["flow"], w)[:2]
+        self.rot_concl.setText(head + ("　·　" + "　·　".join(notes[:3]) if notes else ""))
+
+    def _render_rot_table(self, rows, w):
+        t = self.rot_tbl
+        lab = self.analyzer.rot_label(w)
+        for i, h in enumerate(self.rot_hdr):
+            it = t.horizontalHeaderItem(i)
+            if it is None:
+                continue
+            k = self.rot_cols[i]
+            if k == "cur":
+                # 今日窗口下 "今日%" 会和前一列重名, 改成「涨跌%」
+                txt = "涨跌%" if w == 0 else "%s%%" % lab
+            else:
+                txt = h
+            it.setText(txt + (" ▼" if self.rot_desc else " ▲") if k == self.rot_sort else txt)
+        t.setRowCount(len(rows))
+        fb = QFont()
+        fb.setBold(True)
+        for i, r in enumerate(rows):
+            nm = QTableWidgetItem(r["name"])
+            nm.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            nm.setToolTip("%s · %d 只成分" % (r["name"], r["n"]))
+            t.setItem(i, 0, nm)
+            t.setItem(i, 1, color_item(n0(r["pct"]), r["pct"]))
+            it = color_item(n0(r["cur"], 1), r["cur"])
+            it.setFont(fb)
+            t.setItem(i, 2, it)
+            i3 = color_item(n0(r["fin"], 1), r["fin"])
+            i3.setToolTip("窗口内所有成分、所有交易日里 CLV>0 的部分之和")
+            t.setItem(i, 3, i3)
+            i4 = color_item(n0(r["fout"], 1), r["fout"])
+            i4.setToolTip("窗口内 CLV<0 的部分之和(负值)")
+            t.setItem(i, 4, i4)
+            fn = color_item(n0(r["fnet"], 1), r["fnet"])
+            fn.setFont(fb)
+            fn.setToolTip("净额 = 流入 + 流出（同日同口径，不是主力资金）")
+            t.setItem(i, 5, fn)
+
+    @staticmethod
+    def _bar_cap(vals, q=88):
+        """资金额跨度能到两个数量级(小板块几亿, 宽基几千亿), 线性轴会把小板块压成一条线。
+        按分位截断, 超出的柱子顶到边界并把真实数字写在柱子里。"""
+        v = np.abs(np.asarray(vals, float))
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            return 1.0
+        return max(float(np.percentile(v, q)), 1e-6)
+
+    def _draw_rot_bars(self, rows, w, hl=None):
+        """左: 区间流入/流出分两侧画; 右: 净额(=流入+流出)并标横截面均值。"""
+        import numpy as np2
+        c = self.rot_bar
+        c.fig.clear()
+        if not rows:
+            c.draw()
+            return
+        names = [r["name"] for r in rows]
+        fin = np2.array([r.get("fin") or 0.0 for r in rows], float)
+        fout = np2.array([r.get("fout") or 0.0 for r in rows], float)
+        fnet = np2.array([r.get("fnet") or 0.0 for r in rows], float)
+        y = np2.arange(len(rows))
+        nrow = len(rows)
+        fs_y, fs_v = (7.4, 6.8) if nrow <= 26 else (6.7, 6.1)
+        lab = self.analyzer.rot_label(w)
+
+        gs = c.fig.add_gridspec(1, 2, width_ratios=[2.3, 1], wspace=0.05,
+                                left=0.122, right=0.976, top=0.905, bottom=0.152)
+        ax = c.fig.add_subplot(gs[0])
+        ax.barh(y, fin, height=0.7, color=UP, alpha=0.88, zorder=3)
+        ax.barh(y, fout, height=0.7, color=DOWN, alpha=0.88, zorder=3)
+        ax.set_yticks(y)
+        ax.set_yticklabels(names, fontsize=fs_y)
+        ax.invert_yaxis()
+        ax.axvline(0, color=SUB, lw=0.9, zorder=4)
+        cap = self._bar_cap(np2.concatenate([fin, -fout]))
+        ax.set_xlim(-cap * 1.34, cap * 1.34)
+        ax.set_ylim(len(rows) - 0.5, -0.5)
+        for i in range(nrow):
+            for val, sgn in ((fin[i], 1), (fout[i], -1)):
+                if val == 0:
+                    continue
+                big = abs(val) > cap
+                if sgn > 0:
+                    ax.text(cap * 0.96 if big else val + cap * 0.02, i,
+                            "%.0f" % val, va="center",
+                            ha="right" if big else "left", fontsize=fs_v,
+                            color="white" if big else UP, zorder=5)
+                else:
+                    ax.text(-cap * 0.96 if big else val - cap * 0.02, i,
+                            "%.0f" % abs(val), va="center",
+                            ha="left" if big else "right", fontsize=fs_v,
+                            color="white" if big else DOWN, zorder=5)
+        if hl and hl in names:
+            ax.axhspan(names.index(hl) - 0.5, names.index(hl) + 0.5,
+                       color=ACCENT, alpha=0.14, zorder=0)
+        ax.grid(axis="x", color=GRID, lw=0.5, zorder=0)
+        ax.tick_params(axis="x", labelsize=7)
+        for sp in ("top", "right", "left"):
+            ax.spines[sp].set_visible(False)
+        ax.set_title("%s流入 / 流出 (亿元, 成交额×CLV 代理, 成分合计)　红=流入 绿=流出　"
+                     "超 %.0f 亿的柱子截断标数" % (lab, cap), loc="left", fontsize=9.2, pad=5)
+
+        ax2 = c.fig.add_subplot(gs[1], sharey=ax)
+        ax2.barh(y, fnet, height=0.7,
+                 color=[UP if v >= 0 else DOWN for v in fnet], alpha=0.82, zorder=3)
+        ax2.axvline(0, color=SUB, lw=0.9, zorder=4)
+        fcap = self._bar_cap(fnet)
+        ax2.set_xlim(-fcap * 1.38, fcap * 1.38)
+        ax2.tick_params(labelleft=False, axis="x", labelsize=7)
+        for i, v in enumerate(fnet):
+            if v == 0:
+                continue
+            big = abs(v) > fcap
+            ax2.text(fcap * 0.94 * (1 if v >= 0 else -1) if big
+                     else v + fcap * 0.05 * (1 if v >= 0 else -1), i, "%+.0f" % v,
+                     va="center", ha=("right" if v >= 0 else "left") if big
+                     else ("left" if v >= 0 else "right"),
+                     fontsize=fs_v, color="white" if big else (UP if v >= 0 else DOWN),
+                     zorder=5)
+        mean = float(fnet.mean())
+        ax2.axvline(mean, color=ACCENT, ls=":", lw=1.1, zorder=5)
+        if hl and hl in names:
+            ax2.axhspan(names.index(hl) - 0.5, names.index(hl) + 0.5,
+                        color=ACCENT, alpha=0.14, zorder=0)
+        ax2.grid(axis="x", color=GRID, lw=0.5, zorder=0)
+        for sp in ("top", "right", "left"):
+            ax2.spines[sp].set_visible(False)
+        ax2.set_title("净额(亿元)　点线=板块均值 %+.0f" % mean,
+                      loc="left", fontsize=9.4, pad=5)
+        # 点击联动用的映射: 点第 i 根柱 = 第 i 行
+        self._rot_names = list(names)
+        self._rot_axes = [ax, ax2]
+        if hl and hl in names:
+            r = rows[names.index(hl)]
+            info = ("%s · %d 只成分　今日 %s%%　%s动量 %s%%　流入 %.1f 亿　流出 %.1f 亿　净额 %+.1f 亿"
+                    % (r["name"], r["n"], n0(r["pct"]), lab, n0(r["cur"], 1),
+                       r["fin"] or 0, abs(r["fout"] or 0), r["fnet"] or 0))
+            color, ec = TXT, ACCENT
+        else:
+            info = "点柱子或左侧任一行 → 这里给出该板块同一窗口下的具体数值"
+            color, ec = SUB, GRID
+        c.fig.text(0.122, 0.018, info, fontsize=8.2, color=color, va="bottom", ha="left",
+                   bbox=dict(boxstyle="round,pad=0.35", fc=PANEL2, ec=ec, lw=0.8))
+        c.draw()
+
+    # ---------------- 刷新 ----------------
+    def on_refresh(self):
+        if self.refreshing:
+            return
+        self.refreshing = True
+        self.btn_refresh.setEnabled(False)
+        self.btn_refresh.setText("刷新中…")
+        n = len(self.analyzer.etfs) if self.analyzer else 0
+        self.status.setText(f"后台拉取行情与日K({n}只, 约 {max(1, round(n * 1.2 / 60))} 分钟)…")
+        self._rt = RefreshThread()
+        self._rt.done.connect(self._on_refreshed)
+        self._rt.start()
+
+    def _on_refreshed(self, ok, errs):
+        self.refreshing = False
+        self.btn_refresh.setEnabled(True)
+        self.btn_refresh.setText(" 刷新数据 ")
+        pool = [e for e in errs if e.startswith("[标的池]")]
+        real = [e for e in errs if not e.startswith("[标的池]")]
+        note = f"刷新完成: {ok} 只行情"
+        if pool:
+            note += " · " + pool[0]
+        if real:
+            note += f" · {len(real)} 项失败: {real[0][:50]}"
+        self.status.setText(note)
+        self._load()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyleSheet(QSS)
+    win = ProWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
