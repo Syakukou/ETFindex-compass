@@ -86,8 +86,25 @@ def _f(v):
 
 
 # ------------------------------------------------------------ 数据更新(后台线程)
+def ensure_stdio():
+    """窗口程序没有控制台时 stdout/stderr 是 None, 写一下就会抛 AttributeError。
+
+    行情接口内部有进度条, 一抛就整批失败。这里在取数入口再兜一次底:
+    不依赖主程序模块的导入顺序, 谁先调用都安全。
+    """
+    import os
+    for name in ("stdout", "stderr"):
+        if getattr(_sys, name) is None:
+            try:
+                setattr(_sys, name, open(os.devnull, "w", encoding="utf-8",
+                                         errors="ignore"))
+            except Exception:
+                pass
+
+
 def refresh_data(codes=None):
     """拉取全部/指定 ETF 的实时快照 + 日K, 写库。返回 (ok_count, errors)"""
+    ensure_stdio()
     try:
         import akshare as ak
     except ImportError as e:

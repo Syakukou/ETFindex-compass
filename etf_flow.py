@@ -26,6 +26,12 @@ import urllib.request
 
 from etf_meta import looks_qdii
 
+try:                                   # 窗口程序没有控制台, 进度条一写就崩
+    from etf_app import ensure_stdio as _ensure_stdio
+    _ensure_stdio()
+except Exception:
+    pass
+
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
       "Referer": "https://quote.eastmoney.com/"}
 RF = 0.018          # 无风险利率, BS 反解用

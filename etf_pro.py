@@ -261,7 +261,7 @@ class ChartWidget(QWidget):
 class ProWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(brand.TITLE)
+        self.setWindowTitle(f"{brand.TITLE} · {brand.VERSION}")
         self.resize(1460, 980)
         self.analyzer = None
         self.refreshing = False
@@ -3418,7 +3418,7 @@ class ProWindow(QMainWindow):
             head = "\n".join(_scrub(e)[:160] for e in real[:5])
             more = f"\n… 另有 {len(real) - 5} 项" if len(real) > 5 else ""
             QMessageBox.warning(
-                self, brand.NAME,
+                self, f"{brand.NAME} {brand.VERSION}",
                 f"拉取到 {ok} 只行情, 有 {len(real)} 项失败。\n\n{head}{more}\n\n"
                 f"完整记录见程序目录下的 refresh.log")
         self._load()
@@ -3429,8 +3429,8 @@ class ProWindow(QMainWindow):
             import time as _t
             p = Path(etf_app.DB).parent / "refresh.log"
             with open(str(p), "a", encoding="utf-8") as f:
-                f.write("[%s] ok=%d errs=%d %s\n" % (
-                    _t.strftime("%Y-%m-%d %H:%M:%S"), ok, len(errs),
+                f.write("[%s] v=%s ok=%d errs=%d %s\n" % (
+                    _t.strftime("%Y-%m-%d %H:%M:%S"), brand.VERSION, ok, len(errs),
                     " | ".join(_scrub(e)[:200] for e in errs[:6])))
         except Exception:
             pass
