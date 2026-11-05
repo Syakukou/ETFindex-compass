@@ -6,6 +6,7 @@ ETF 量化分析终端 (PySide6 专业桌面软件, 暗色终端风格)
 - 分析引擎: etf_analytics.py (四因子评分/相关性/轮动/每日结论)
 - 数据: 复用 etf_app.py 的 SQLite 与刷新逻辑
 """
+import os
 import sys
 import threading
 from pathlib import Path
@@ -29,6 +30,25 @@ from PySide6.QtWidgets import (
 
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
+
+
+def _restore_stdio():
+    """打包成窗口程序后 stdout/stderr 是 None。
+
+    行情接口内部用进度条往 stderr 写, 一写就抛 AttributeError, 整个快照接口
+    整批失败: 表现为价格和份额全是「—」, 而日K、期货因为不走进度条反而正常。
+    挂到 devnull 上即可, 窗口程序不需要这些输出。
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8",
+                                        errors="ignore"))
+            except Exception:
+                pass
+
+
+_restore_stdio()
 from etf_analytics import Analyzer  # noqa: E402
 from etf_meta import looks_qdii  # noqa: E402
 import etf_app  # noqa: E402
