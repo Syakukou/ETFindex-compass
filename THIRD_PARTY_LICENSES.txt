@@ -1,7 +1,8 @@
 IndexCompass 第三方开源组件声明
 ================================
 
-本项目自身以 MIT 许可发布，详见 LICENSE。
+本项目自身以 GNU General Public License v3.0 发布，详见 LICENSE。
+Copyright (C) 2026 Syakukou。
 
 Release 中提供的 Windows 打包产物（onedir 压缩包）内含以下第三方开源组件。
 各组件的著作权归其各自作者所有，遵循其原始许可条款。本文件仅作声明与致谢，
