@@ -1,0 +1,15 @@
+# 统一换行，避免 Windows 提交污染 diff
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.spec text eol=lf
+
+# 二进制
+*.png binary
+*.db binary
+*.exe binary
+*.zip binary
