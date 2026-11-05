@@ -12,7 +12,7 @@ a = Analysis(
     ['etf_pub.py'],
     pathex=[],
     binaries=[],
-    datas=[('etf_list.json', '.')] + data_files,
+    datas=[('etf_list.json', '.'), ('icons/icon_a.ico', 'icons')] + data_files,
     hiddenimports=(['brand', 'etf_flow', 'etf_hold', 'etf_inst', 'etf_meta', 'etf_analytics']
                    + data_mods),
     hookspath=[],
@@ -30,6 +30,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='IndexCompass',
+    icon='icons/icon_a.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

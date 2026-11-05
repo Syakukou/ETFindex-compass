@@ -19,7 +19,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
-from PySide6.QtGui import QColor, QFont, QAction
+from PySide6.QtGui import QColor, QFont, QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QComboBox, QTableWidget, QTableWidgetItem,
@@ -3394,10 +3394,25 @@ class ProWindow(QMainWindow):
         self._load()
 
 
+def _app_icon():
+    """窗口与任务栏图标。打包后资源在 _internal, 源码运行时在项目目录。"""
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    for rel in ("icons/icon_a.ico", "icon_a.ico"):
+        p = root / rel
+        if p.exists():
+            return QIcon(str(p))
+    return QIcon()
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(QSS)
+    icon = _app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     win = ProWindow()
+    if not icon.isNull():
+        win.setWindowIcon(icon)
     win.show()
     sys.exit(app.exec())
 

@@ -44,3 +44,6 @@ ui_preview.png
 final_flow.png
 idx_preview.png
 shot_hold4.png
+
+# 图标生成过程中的中间尺寸，只留 ico 与预览
+icons/icon_*_[0-9]*.png
