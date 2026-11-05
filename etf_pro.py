@@ -3395,12 +3395,17 @@ class ProWindow(QMainWindow):
 
 
 def _app_icon():
-    """窗口与任务栏图标。打包后资源在 _internal, 源码运行时在项目目录。"""
+    """窗口与任务栏图标。打包后资源在 _internal, 源码运行时在项目目录。
+
+    两个构建用不同配色: 发布版墨绿琥珀, 自用版深灰蓝亮蓝。
+    """
     root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    for rel in ("icons/icon_a.ico", "icon_a.ico"):
-        p = root / rel
-        if p.exists():
-            return QIcon(str(p))
+    names = ("icon_a.ico", "icon_self.ico") if brand.PUBLISH else ("icon_self.ico", "icon_a.ico")
+    for name in names:
+        for rel in ("icons/" + name, name):
+            p = root / rel
+            if p.exists():
+                return QIcon(str(p))
     return QIcon()
 
 
