@@ -1,0 +1,11 @@
+# 自动跟踪 GitHub Actions 的版本，避免再次出现 Node 运行时被淘汰后才发现
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
