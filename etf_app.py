@@ -7,6 +7,7 @@ ETF 跟踪面板 - 本地独立软件
 - 指标: 前端计算 MA / MACD / BOLL, 后端供原始K线与快照
 """
 import json
+import shutil
 import sqlite3
 
 import brand
@@ -54,6 +55,16 @@ DEFAULT_ETFS = [
 def load_etfs():
     if CONFIG.exists():
         return json.loads(CONFIG.read_text(encoding="utf-8"))
+    # 打包后资源落在 _internal, 而 CONFIG 找的是 exe 同级目录。不搬一次的话,
+    # 首次启动只能拿到 9 只内置标的, 看起来像"全池没拉出来"。
+    bundled = Path(getattr(_sys, "_MEIPASS", BASE)) / "etf_list.json"
+    if bundled.exists() and bundled.resolve() != CONFIG.resolve():
+        try:
+            shutil.copyfile(str(bundled), str(CONFIG))
+            if CONFIG.exists():
+                return json.loads(CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     CONFIG.write_text(json.dumps(DEFAULT_ETFS, ensure_ascii=False, indent=2),
                       encoding="utf-8")
     return DEFAULT_ETFS

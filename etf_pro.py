@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QTextEdit, QSplitter, QGroupBox, QStatusBar,
-    QToolBar, QSizePolicy, QListWidget, QListWidgetItem, QLineEdit, QCheckBox, QDialog)
+    QToolBar, QSizePolicy, QListWidget, QListWidgetItem, QLineEdit, QCheckBox, QDialog,
+    QMessageBox)
 
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
@@ -3391,7 +3392,36 @@ class ProWindow(QMainWindow):
         if real:
             note += f" · {len(real)} 项失败: {real[0][:50]}"
         self.status.setText(note)
+        self._log_refresh(ok, errs)
+        # 整批失败才弹窗: 单只日K偶发失败不该每次刷新都打扰
+        if ok == 0 or any(e.startswith("行情接口失败") for e in real):
+            head = "\n".join(_scrub(e)[:160] for e in real[:5])
+            more = f"\n… 另有 {len(real) - 5} 项" if len(real) > 5 else ""
+            QMessageBox.warning(
+                self, brand.NAME,
+                f"拉取到 {ok} 只行情, 有 {len(real)} 项失败。\n\n{head}{more}\n\n"
+                f"完整记录见程序目录下的 refresh.log")
         self._load()
+
+    def _log_refresh(self, ok, errs):
+        """每次刷新落一行到程序目录, 出问题能直接翻, 不用靠用户复述状态栏。"""
+        try:
+            import time as _t
+            p = Path(etf_app.DB).parent / "refresh.log"
+            with open(str(p), "a", encoding="utf-8") as f:
+                f.write("[%s] ok=%d errs=%d %s\n" % (
+                    _t.strftime("%Y-%m-%d %H:%M:%S"), ok, len(errs),
+                    " | ".join(_scrub(e)[:200] for e in errs[:6])))
+        except Exception:
+            pass
+
+
+def _scrub(msg):
+    """发布版不出现数据接口库的名字, 报错文本里也要盖掉。"""
+    s = str(msg)
+    if brand.PUBLISH:
+        s = s.replace("akshare", "行情接口").replace("AKShare", "行情接口")
+    return s
 
 
 def _app_icon():
