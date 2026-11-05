@@ -31,6 +31,15 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements.txt
 
+      # 标签与 brand.VERSION 不一致时直接失败，避免发出去的包和版本号对不上
+      - name: 校验版本号
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python -c "import os,re; s=open('brand.py',encoding='utf-8').read(); v=re.search(r'VERSION\s*=\s*.(v[0-9.]+).',s).group(1); print('tag=%s version=%s' % (os.environ['TAG'],v)); raise SystemExit(0 if v==os.environ['TAG'] else 1)"
+
       - name: 安装依赖
         shell: pwsh
         run: |
@@ -61,7 +70,7 @@ jobs:
 
       - name: 发布到 Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: IndexCompass-windows.zip
           generate_release_notes: true
