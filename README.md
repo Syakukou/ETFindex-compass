@@ -1,6 +1,10 @@
-# 指数罗盘 · IndexCompass
+# ETF 指数罗盘 · IndexCompass
 
-A 股 ETF 资金与持仓观察台。PySide6 + matplotlib 单机运行，数据由本机向公开行情接口实时请求。
+[![build](https://github.com/Syakukou/ETFindex-compass/actions/workflows/build.yml/badge.svg)](https://github.com/Syakukou/ETFindex-compass/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/Syakukou/ETFindex-compass)](https://github.com/Syakukou/ETFindex-compass/releases)
+[![license](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+
+A 股场内 ETF 的监测工具。覆盖 168 只 ETF 的评分、分时与多周期 K 线、相关性、风险收益、板块轮动、资金流与持仓穿透。PySide6 + matplotlib 单机运行，数据由本机向公开行情接口实时请求，不上传任何本地数据。
 
 > **先读这段再决定要不要用**
 >
@@ -29,8 +33,8 @@ A 股 ETF 资金与持仓观察台。PySide6 + matplotlib 单机运行，数据�
 需要 Python 3.10 以上。
 
 ```bash
-git clone <repo-url>
-cd etf-tracker
+git clone https://github.com/Syakukou/ETFindex-compass.git
+cd ETFindex-compass
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
@@ -122,6 +126,7 @@ etf_pro.py        主程序，PySide6 七页签终端
 etf_app.py        SQLite 存储与行情刷新
 etf_analytics.py  四因子评分、相关性、轮动、每日结论
 etf_flow.py       ETF 资金流与 K 线
+etf_minute.py     分时与分钟线、周月 K 聚合
 etf_hold.py       成分股持仓（全部季度）
 etf_inst.py       机构与北向持股
 etf_index.py      指数、期货、期权数据
