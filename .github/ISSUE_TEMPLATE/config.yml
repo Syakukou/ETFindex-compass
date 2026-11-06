@@ -3,6 +3,9 @@ contact_links:
   - name: 使用说明与数据口径
     url: https://github.com/Syakukou/ETFindex-compass#readme
     about: 装不上、数字对不上、某只 ETF 只有十几行持仓，答案多半已经写在 README 里
+  - name: 开放讨论（Discussions）
+    url: https://github.com/Syakukou/ETFindex-compass/discussions
+    about: 指标怎么解读、这类 ETF 该不该看、你平时怎么用，这类没有标准答案的话题放这里
   - name: 下载最新版本
     url: https://github.com/Syakukou/ETFindex-compass/releases/latest
     about: Windows 免安装包。请先完整解压，不要在压缩包预览窗口里直接双击 exe
