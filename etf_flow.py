@@ -111,10 +111,14 @@ def fetch_idx_quotes(timeout=12):
     return out
 
 
-def fetch_idx_kline(secid, lmt=90, timeout=12):
-    """[(date, close, high, low, amount亿)] 升序"""
+def fetch_idx_kline(secid, lmt=420, timeout=15):
+    """[(date, close, high, low, amount亿, open, volume)] 升序
+
+    末尾多带开盘价与成交量, 供进出页画蜡烛; 前五位语义不变,
+    原来按 k[1]=收盘 / k[4]=成交额 取值的调用不受影响。
+    """
     url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=" + secid +
-           "&fields1=f1,f2,f3&fields2=f51,f53,f54,f55,f57&klt=101&fqt=1&lmt=" +
+           "&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&lmt=" +
            str(lmt) + "&end=20500101")
     d = json.loads(urllib.request.urlopen(
         urllib.request.Request(url, headers=UA), timeout=timeout).read().decode())
@@ -122,10 +126,14 @@ def fetch_idx_kline(secid, lmt=90, timeout=12):
     for s in ((d.get("data") or {}).get("klines") or []):
         p = s.split(",")
         try:
-            out.append((p[0], float(p[1]), float(p[2]), float(p[3]),
-                        float(p[4]) / 1e8 if len(p) > 4 and p[4] else 0.0))
+            close = float(p[2])
+            hi, lo = float(p[3]), float(p[4])
+            op = float(p[1]) if len(p) > 1 and p[1] not in ("", "-") else close
+            vol = float(p[5]) if len(p) > 5 and p[5] not in ("", "-") else 0.0
+            amt = float(p[6]) / 1e8 if len(p) > 6 and p[6] else 0.0
         except (ValueError, IndexError):
             continue
+        out.append((p[0], close, hi, lo, amt, op, vol))
     return out
 
 
@@ -303,7 +311,7 @@ def etf_groups(rows):
     return out
 
 
-def load_mom(db_path, codes, days=40):
+def load_mom(db_path, codes, days=260):
     """从本地 K 线算 5 日 CLV 加权资金流(亿元)序列与 5 日成交额。
 
     CLV = (2*close-high-low)/(high-low), 乘成交额后再滚动 5 日累加, 是二级市场
@@ -343,9 +351,9 @@ def load_mom(db_path, codes, days=40):
     return out
 
 
-def etf_klines(db_path, codes, n=60):
+def etf_klines(db_path, codes, n=250):
     """单只 ETF 的日线, 供页签里点选某只后单独画图。
-    {code: [(date, close, high, low, amount亿)]} 升序
+    {code: [(date, close, high, low, amount亿, open, volume)]} 升序
     """
     import sqlite3
     out = {}
@@ -356,17 +364,23 @@ def etf_klines(db_path, codes, n=60):
     try:
         for c in codes:
             rs = con.execute(
-                "select trade_date,close,high,low,amount from kline where code=? "
-                "order by trade_date desc limit ?", (c, n)).fetchall()
+                "select trade_date,close,high,low,amount,open,volume from kline "
+                "where code=? order by trade_date desc limit ?", (c, n)).fetchall()
             rs.reverse()
             ser = []
-            for d, cl, h, l, am in rs:
+            for row in rs:
+                d, cl, h, l, am = row[0], row[1], row[2], row[3], row[4]
+                op = row[5] if len(row) > 5 else None
+                vol = row[6] if len(row) > 6 else None
                 if not cl:
                     continue
-                ser.append((d, float(cl),
-                            float(h) if h else float(cl),
-                            float(l) if l else float(cl),
-                            (float(am) / 1e8) if am else 0.0))
+                cl = float(cl)
+                ser.append((d, cl,
+                            float(h) if h else cl,
+                            float(l) if l else cl,
+                            (float(am) / 1e8) if am else 0.0,
+                            float(op) if op else cl,
+                            float(vol) if vol else 0.0))
             out[c] = ser
     finally:
         con.close()
@@ -520,7 +534,7 @@ def build(rows, idx_klines, fut, opt, quotes):
         for i in g:
             for d, v in (i.get("mom_ser") or []):
                 agg[d] = agg.get(d, 0.0) + v
-        mom_ser = sorted(agg.items())[-40:] if agg else []
+        mom_ser = sorted(agg.items())[-260:] if agg else []
         a5 = sum(i["amt5"] or 0 for i in g if i.get("amt5"))
 
         f = fut.get(x.future) if x.future else None
@@ -547,7 +561,7 @@ def build(rows, idx_klines, fut, opt, quotes):
             "pcr_near": o.get("pcr_near") if o and not o.get("err") else None,
             "iv": o.get("iv") if o and not o.get("err") else None,
             "members": sorted(g, key=lambda i: -(i["mi"] if i["mi"] is not None else -9e9)),
-            "kline": kl[-60:],
+            "kline": kl[-420:],
         }
         sc, parts = score(r)
         r["score"], r["parts"] = sc, parts

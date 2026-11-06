@@ -81,6 +81,29 @@ plt.rcParams.update(DARK_RC)
 # 走势页的周期选项 → 分钟接口的 period 参数
 PERIOD_MIN = {"5分钟": "5", "15分钟": "15", "30分钟": "30", "60分钟": "60"}
 
+# 周期档位: 从细到粗。滚轮与上下键沿这条序列连续缩放, 缩到本档最小/最大再走一步就跨档,
+# 和券商软件的手感一致(往上推变细, 往下推变粗)。
+PERIODS = ["分时", "5分钟", "15分钟", "30分钟", "60分钟", "日K", "周K", "月K"]
+ZOOM_MIN_BARS = 30      # 同一周期内最多放大到只看 30 根
+ZOOM_RATIO = 1.25       # 每格滚轮改变可见根数的比例
+AUTO_VIS = 120          # 滚轮跨到更细的周期时先给这么多根, 不至于一次摊开几百根
+FLOW_PERIODS = ["日K", "周K", "月K"]   # 进出页只有日频资金流, 最细到日K
+FLOW_DEF_VIS = 60
+FLOW_ZOOM_RATIO = 1.6   # 进出页横轴更短, 用更大的步长, 三格就能从近60根看到周K
+
+
+def _bucket_key(d, mode):
+    """日期 -> 分组键: 周K 用 ISO 周, 月K 用自然月, 其余原样。"""
+    d = str(d)
+    if mode != "W":
+        return d[:7]
+    import datetime as _dt
+    try:
+        y, w, _ = _dt.date(*[int(x) for x in d[:10].split("-")]).isocalendar()
+        return "%04d-W%02d" % (y, w)
+    except Exception:
+        return d
+
 
 def _fmt_vol(y, _pos=None):
     """成交量刻度: 用万/亿, 免得出现 1e7 那种科学计数。"""
@@ -450,9 +473,9 @@ class ProWindow(QMainWindow):
         lay.addWidget(lw)
         right = QVBoxLayout()
         self.period_cb = QComboBox()
-        self.period_cb.addItems(["分时", "5分钟", "15分钟", "30分钟",
-                                 "60分钟", "日K", "周K", "月K"])
+        self.period_cb.addItems(PERIODS)
         self.period_cb.setCurrentText("日K")
+        self.period_cb.setToolTip("也可以直接用滚轮或 ↑ ↓ 缩放切换, 手感跟券商软件一样")
         self.period_cb.currentTextChanged.connect(self._on_period_change)
         self.sub_mode = QComboBox()
         self.sub_mode.addItems(["MACD", "RSI", "KDJ"])
@@ -463,6 +486,9 @@ class ProWindow(QMainWindow):
         top.addSpacing(10)
         top.addWidget(QLabel("副图:"))
         top.addWidget(self.sub_mode)
+        self.zoom_hint = QLabel("滚轮 / ↑↓ 缩放切周期")
+        self.zoom_hint.setObjectName("meta")
+        top.addWidget(self.zoom_hint)
         top.addStretch(1)
         self.kinfo = QLabel("")
         self.kinfo.setObjectName("meta")
@@ -471,10 +497,16 @@ class ProWindow(QMainWindow):
         self.kchart = ChartWidget(figsize=(10, 7))
         self.kchart.canvas.mpl_connect("button_press_event", self._kline_click)
         self.kchart.canvas.mpl_connect("button_press_event", self._intraday_click)
+        self.kchart.canvas.mpl_connect("scroll_event", self._kline_scroll)
+        self.kchart.canvas.mpl_connect("key_press_event", self._kline_key)
+        self.kchart.canvas.setFocusPolicy(Qt.StrongFocus)
+        self.kchart.setToolTip("滚轮放大缩小切周期, ↑↓ 同效; 单击看某个交易日的明细")
         self._k_ctx = None
         self._i_ctx = None
         self._mdata = {}       # (code, period) -> 已取到的分钟数据
         self._mthread = None   # 只保留最新一次请求, 防止连点刷屏
+        self._vis = None       # 当前周期下可见根数, None = 全部
+        self._bar_total = 0
         right.addWidget(self.kchart, 1)
         rw = QWidget(); rw.setLayout(right)
         lay.addWidget(rw, 1)
@@ -1008,6 +1040,9 @@ class ProWindow(QMainWindow):
         top.setSpacing(6)
         self.flow_title = QLabel("—")
         top.addWidget(self.flow_title)
+        self.flow_plbl = QLabel("日K · 近%d根" % FLOW_DEF_VIS)
+        self.flow_plbl.setObjectName("meta")
+        top.addWidget(self.flow_plbl)
         self.flow_meta = QLabel("加载中…")
         self.flow_meta.setObjectName("meta")
         top.addWidget(self.flow_meta, 1)
@@ -1035,7 +1070,17 @@ class ProWindow(QMainWindow):
         cv.setSpacing(2)
         self.flow_chart = ChartWidget(figsize=(9, 4.2))
         self.flow_chart.canvas.mpl_connect("button_press_event", self._flow_click)
+        self.flow_chart.canvas.mpl_connect("scroll_event", self._flow_scroll)
+        self.flow_chart.canvas.mpl_connect("key_press_event", self._flow_key)
+        self.flow_chart.canvas.setFocusPolicy(Qt.StrongFocus)
+        self.flow_chart.setToolTip(
+            "滚轮放大缩小: 日K → 周K → 月K; 同一档内继续滚会改看的根数\n"
+            "↑↓ 同效, 单击看当天的收盘与资金动能")
         self._flow_ctx = None
+        self._flow_p = "日K"
+        self._flow_vis = FLOW_DEF_VIS
+        self._flow_total = 0
+        self._flow_args = None
         cv.addWidget(self.flow_chart, 1)
         self.flow_note = QLabel("")
         self.flow_note.setObjectName("meta")
@@ -2122,7 +2167,7 @@ class ProWindow(QMainWindow):
         kl = []
         try:
             import etf_flow
-            kl = etf_flow.etf_klines(str(etf_app.DB), [code], 60).get(code) or []
+            kl = etf_flow.etf_klines(str(etf_app.DB), [code], 250).get(code) or []
         except Exception:
             kl = []
         cache[code] = kl
@@ -2180,36 +2225,165 @@ class ProWindow(QMainWindow):
         if self.cur_idx:
             self._fill_idx_detail(self.cur_idx)
 
+    # ---- 进出页的周期与缩放
+    @staticmethod
+    def _flow_bars(raw, period):
+        """原始日线 -> 画图用的 bar 列表(d/o/c/h/l/a/v); 周月K在本地聚合, 不额外发请求。"""
+        pts = []
+        for r in raw or []:
+            try:
+                d = str(r[0])
+                cl = float(r[1])
+                hi = float(r[2]) if r[2] else cl
+                lo = float(r[3]) if r[3] else cl
+            except (TypeError, ValueError, IndexError):
+                continue
+            amt = float(r[4]) if len(r) > 4 and r[4] else 0.0
+            op = float(r[5]) if len(r) > 5 and r[5] else cl
+            vol = float(r[6]) if len(r) > 6 and r[6] else 0.0
+            pts.append(dict(d=d, o=op or cl, c=cl, h=max(hi, cl),
+                            l=min(lo, cl), a=amt, v=vol))
+        if period == "日K" or len(pts) < 3:
+            return pts
+        mode = "W" if period == "周K" else "M"
+        out, key, cur = [], None, None
+        for p in pts:
+            k = _bucket_key(p["d"], mode)
+            if k != key:
+                if cur:
+                    out.append(cur)
+                key = k
+                cur = dict(p)
+                cur["k"] = k
+            else:
+                cur["d"] = p["d"]          # 用分组末个交易日做横轴标签
+                cur["c"] = p["c"]
+                cur["h"] = max(cur["h"], p["h"])
+                cur["l"] = min(cur["l"], p["l"])
+                cur["a"] += p["a"]
+                cur["v"] += p["v"]
+        if cur:
+            out.append(cur)
+        return out
+
+    def _flow_zoom(self, d):
+        """d>0 放大(更少根/更细周期), d<0 缩小。日K 是最细一档, 资金流本来就只有日频。"""
+        i = FLOW_PERIODS.index(getattr(self, "_flow_p", "日K"))
+        total = int(getattr(self, "_flow_total", 0) or 0)
+        vis = getattr(self, "_flow_vis", None)
+        if vis == "auto":
+            vis = min(total, AUTO_VIS) if total else None
+        if d > 0:
+            if vis is None and total:
+                vis = total
+            if vis:
+                nv = max(min(ZOOM_MIN_BARS, vis),
+                         int(round(vis / ZOOM_RATIO)))
+                if nv < vis:
+                    self._flow_vis = nv
+                    self._flow_redraw()
+                    return
+            if i > 0:
+                self._flow_p = FLOW_PERIODS[i - 1]
+                self._flow_vis = "auto"
+                self._flow_redraw()
+            else:
+                self.status.setText("进出页最细就是日K: 资金动能只有日频")
+            return
+        if vis is None:
+            if i < len(FLOW_PERIODS) - 1:
+                self._flow_p = FLOW_PERIODS[i + 1]
+                self._flow_vis = None
+                self._flow_redraw()
+            else:
+                self.status.setText("已经是最大周期: 月K")
+            return
+        nv = int(round(vis * FLOW_ZOOM_RATIO))
+        if nv >= max(1, int(total * 0.55)):
+            if i < len(FLOW_PERIODS) - 1:
+                self._flow_p = FLOW_PERIODS[i + 1]
+                self._flow_vis = None
+            else:
+                self._flow_vis = None
+            self._flow_redraw()
+        else:
+            self._flow_vis = nv
+            self._flow_redraw()
+
+    def _flow_redraw(self):
+        if not getattr(self, "_flow_args", None):
+            return
+        self.draw_flow(*self._flow_args)
+
+    def _flow_scroll(self, ev):
+        if ev.button == "up":
+            self._flow_zoom(1)
+        elif ev.button == "down":
+            self._flow_zoom(-1)
+
+    def _flow_key(self, ev):
+        if ev.key in ("up", "+", "=", "pageup"):
+            self._flow_zoom(1)
+        elif ev.key in ("down", "-", "_", "pagedown"):
+            self._flow_zoom(-1)
+
     def draw_flow(self, g, m=None, kl=None):
-        """m/kl 有值 = 画单只 ETF; 否则画该指数全校 ETF 的合计"""
+        """m/kl 有值 = 画单只 ETF; 否则画该指数全部 ETF 的合计。
+
+        上图是蜡烛(日/周/月K), 下图是 5 日资金动能; 滚轮或 ↑↓ 缩放切周期,
+        同一档内继续缩就改看的根数, 单击定位到某一天。
+        """
+        self._flow_args = (g, m, kl)
         c = self.flow_chart
         c.fig.clear()
         one = bool(m and kl)
-        ikl = (g.get("kline") or [])[-38:]
-        mom = dict(((m or {}).get("mom_ser") if one else g.get("mom_ser")) or [])
-        has_flow = bool(mom)
-        # 交易日历可能不同: 纳指/日经比 A 股少一天, 恒生同一天。
-        # 主轴统一取资金动能序列的日期, 指数收盘按日期回填, 否则跨境品种会整条错位、
-        # 资金柱按错位日期取值后全变 0。
-        if has_flow:
-            dates = sorted(mom.keys())[-38:]
+        period = getattr(self, "_flow_p", "日K")
+        raw = (kl if one else (g.get("kline") or [])) or []
+        bars = self._flow_bars(raw, period)
+        self._flow_total = len(bars)
+        if len(bars) < 8:
+            self.flow_plbl.setText("%s · 数据不足" % period)
+            self._flow_ctx = None
+            c.draw()
+            return
+
+        # 均线在全序列上算, 再跟着截尾, 否则缩到近 30 根时前段全是空值
+        closes = [b["c"] for b in bars]
+
+        def _ma(k):
+            out = []
+            for i in range(len(closes)):
+                seg = closes[max(0, i - k + 1):i + 1]
+                out.append(sum(seg) / len(seg))
+            return out
+
+        ma5, ma20 = _ma(5), _ma(20)
+        vis = getattr(self, "_flow_vis", None)
+        if vis == "auto":
+            vis = min(len(bars), AUTO_VIS)
+            self._flow_vis = vis
+        st = 0
+        if vis and len(bars) > vis:
+            st = len(bars) - int(vis)
+        bars, ma5, ma20 = bars[st:], ma5[st:], ma20[st:]
+        n = len(bars)
+        xs = list(range(n))
+        dates = [b["d"] for b in bars]
+        closes = [b["c"] for b in bars]
+        mode = "" if period == "日K" else ("W" if period == "周K" else "M")
+        keys = [(_bucket_key(d, mode) if mode else d) for d in dates]
+
+        # 5 日动能: 日频取当日值; 周/月取该分组末日的值(滚动5日累计不能相加, 会重叠加总)
+        src = dict(((m or {}).get("mom_ser") if one else g.get("mom_ser")) or {})
+        if mode:
+            mom = {}
+            for d0, v0 in src.items():
+                mom[_bucket_key(d0, mode)] = v0
         else:
-            dates = [k[0] for k in (kl if one else ikl)][-38:]
-        if len(dates) < 8:
-            self._flow_ctx = None
-            c.draw()
-            return
-        xs = list(range(len(dates)))
-        src = {k[0]: k[1] for k in ((kl if one else ikl) or [])}
-        close = _ffill([src.get(d) for d in dates])
-        if not close or close[0] is None:
-            self._flow_ctx = None
-            c.draw()
-            return
-        ma = []
-        for i in range(len(close)):
-            seg = close[max(0, i - 19):i + 1]
-            ma.append(sum(seg) / len(seg))
+            mom = src
+        has_flow = bool(mom)
+        vals = [mom.get(k) for k in keys]
+
         if has_flow:
             gs = c.fig.add_gridspec(2, 1, height_ratios=[1.28, 1], hspace=0.14)
             ax1 = c.fig.add_subplot(gs[0])
@@ -2217,53 +2391,69 @@ class ProWindow(QMainWindow):
         else:
             ax1 = c.fig.add_subplot(111)
             ax2 = None
-        pc = (m.get("pct") if one else g.get("pct")) or 0
-        ax1.plot(xs, close, color=(UP if pc >= 0 else DOWN), lw=1.5, label="收盘")
-        ax1.plot(xs, ma, color=ACCENT, lw=1.0, ls="--", label="MA20")
+
+        o = np.array([b["o"] for b in bars], float)
+        cl = np.array(closes, float)
+        hi = np.array([b["h"] for b in bars], float)
+        lo = np.array([b["l"] for b in bars], float)
+        colr = np.where(cl >= o, UP, DOWN)
+        ax1.vlines(xs, lo, hi, color=colr, lw=0.7)
+        ax1.bar(xs, np.abs(cl - o) + 1e-12, 0.68, bottom=np.minimum(o, cl),
+                color=colr, zorder=3)
+        ax1.plot(xs, ma5, lw=0.9, color="#f5a623", label="MA5")
+        ax1.plot(xs, ma20, lw=0.9, color=ACCENT, ls="--", label="MA20")
         if one:
-            ax1.set_title("%s · %s %s · 近 %d 日" % (g["name"], m["name"], m["code"], len(dates)),
-                          loc="left", fontsize=10, color=TXT)
-            imap = {k[0]: k[1] for k in ikl}
-            iy = _ffill([imap.get(d3) for d3 in dates]) if imap else []
-            px = xs if (iy and iy[0] is not None) else []
-            py = iy if px else []
-            if px:
+            ax1.set_title("%s · %s %s · %s %d根" % (
+                g["name"], m["name"], m["code"], period, n),
+                loc="left", fontsize=10, color=TXT)
+            imap = {k[0]: k[1] for k in (g.get("kline") or [])}
+            iy = [imap.get(d3) for d3 in dates]
+            if any(y is not None for y in iy):
+                iy = _ffill(iy)
                 ax1b = ax1.twinx()
-                li, = ax1b.plot(px, py, color=SUB, lw=0.9, alpha=0.6, label="指数(右轴)")
+                li, = ax1b.plot(xs, iy, color=SUB, lw=0.9, alpha=0.6, label="指数(右轴)")
                 ax1b.tick_params(labelsize=7, colors=SUB, pad=1)
                 ax1b.spines["top"].set_visible(False)
                 h1, l1 = ax1.get_legend_handles_labels()
-                ax1.legend(h1 + [li], l1 + ["指数(右轴)"], loc="best",
-                           fontsize=7, frameon=False, ncol=3)
+                ax1.legend(h1 + [li], l1 + ["指数(右轴)"], loc="upper left",
+                           fontsize=7, frameon=False, ncol=4)
             else:
-                ax1.legend(loc="lower left", fontsize=7, frameon=False, ncol=2)
+                ax1.legend(loc="upper left", fontsize=7, frameon=False, ncol=3)
         else:
-            ax1.set_title("%s · 近 %d 日 · 评分 %d %s" % (
-                g["name"], len(dates), round(g["score"]), g["state"]),
+            ax1.set_title("%s · %s %d根 · 评分 %d %s" % (
+                g["name"], period, n, round(g["score"]), g["state"]),
                 loc="left", fontsize=10, color=TXT)
-            ax1.legend(loc="lower left", fontsize=7, frameon=False, ncol=2)
+            ax1.legend(loc="upper left", fontsize=7, frameon=False, ncol=3)
         ax1.grid(alpha=0.22, ls=":")
         ax1.tick_params(labelbottom=not has_flow, labelsize=7)
         for sp in ("top", "right"):
             ax1.spines[sp].set_visible(False)
 
         if has_flow:
-            vals = [mom.get(d3, 0.0) for d3 in dates]
             lab = "该ETF 5日资金动能(亿)" if one else "ETF 5日资金动能(亿)"
-            ax2.bar(xs, vals, color=[UP if v >= 0 else DOWN for v in vals],
-                    width=0.72, alpha=0.85, label=lab)
+            px = [x for x, v in zip(xs, vals) if v is not None]
+            pv = [v for v in vals if v is not None]
+            if pv:
+                ax2.bar(px, pv, color=[UP if v >= 0 else DOWN for v in pv],
+                        width=0.7, alpha=0.85, label=lab)
+                # 前段没柱子是本地库没有那段资金记录, 不是零流入, 得说明白
+                if px[0] > max(2, int(n * 0.3)):
+                    ax2.annotate("资金动能自 %s 起有记录" % dates[px[0]],
+                                 xy=(px[0], 0), xytext=(4, -9),
+                                 textcoords="offset points", fontsize=6.5, color=SUB)
             ax2.axhline(0, color=GRID, lw=0.8)
             ax2.grid(alpha=0.2, ls=":")
             ax2.tick_params(labelsize=7)
             for sp in ("top", "right"):
                 ax2.spines[sp].set_visible(False)
             bs = dict(g.get("basis_ser") or {})
-            if bs and not one:
+            # 基差是日频, 切到周/月K 就不硬套, 免得看着像周度基差
+            if bs and not one and period == "日K":
                 ax3 = ax2.twinx()
                 bys = [bs.get(d3) for d3 in dates]
-                px = [x for x, y in zip(xs, bys) if y is not None]
-                py = [y for y in bys if y is not None]
-                l3, = ax3.plot(px, py, color=WARN, lw=1.2, label="期货基差率%(右轴)")
+                bx = [x for x, y in zip(xs, bys) if y is not None]
+                by = [y for y in bys if y is not None]
+                l3, = ax3.plot(bx, by, color=WARN, lw=1.2, label="期货基差率%(右轴)")
                 ax3.tick_params(labelsize=7, colors=WARN, pad=1)
                 ax3.spines["right"].set_color(WARN)
                 ax3.spines["top"].set_visible(False)
@@ -2274,37 +2464,38 @@ class ProWindow(QMainWindow):
                 ax2.legend(loc="upper left", fontsize=7, frameon=False)
             # 最近一次资金方向翻转, 就是图上能看到的进场时点
             mark = None
-            for i in range(len(vals) - 1, 0, -1):
-                if vals[i - 1] < 0 <= vals[i]:
-                    mark = (i, "资金转正", UP)
+            for j in range(len(pv) - 1, 0, -1):
+                if pv[j - 1] < 0 <= pv[j]:
+                    mark = (px[j], "资金转正", UP)
                     break
             if mark is None:
-                for i in range(len(vals) - 1, 0, -1):
-                    if vals[i - 1] > 0 >= vals[i]:
-                        mark = (i, "资金转负", DOWN)
+                for j in range(len(pv) - 1, 0, -1):
+                    if pv[j - 1] > 0 >= pv[j]:
+                        mark = (px[j], "资金转负", DOWN)
                         break
             if mark:
-                i0, lab2, cl = mark
-                right = i0 > len(dates) * 0.78
-                ax2.axvline(i0, color=cl, lw=0.9, ls="--", alpha=0.75)
+                i0, lab2, cl2 = mark
+                right = i0 > n * 0.78
+                ax2.axvline(i0, color=cl2, lw=0.9, ls="--", alpha=0.75)
                 ax2.annotate(lab2 + " " + dates[i0][5:], xy=(i0, 0),
                              xytext=(-4 if right else 4, 7), textcoords="offset points",
-                             fontsize=7, color=cl, ha="right" if right else "left",
+                             fontsize=7, color=cl2, ha="right" if right else "left",
                              bbox=dict(facecolor=PANEL, alpha=0.72, edgecolor="none", pad=1.2))
-            step = max(1, len(dates) // 8)
+            step = max(1, n // 8)
             ax2.set_xticks(xs[::step])
-            ax2.set_xticklabels([dates[i][5:] for i in xs[::step]], fontsize=7)
+            ax2.set_xticklabels([dates[i][5:10] for i in xs[::step]], fontsize=7)
         else:
-            step = max(1, len(dates) // 8)
+            step = max(1, n // 8)
             ax1.set_xticks(xs[::step])
-            ax1.set_xticklabels([dates[i][5:] for i in xs[::step]], fontsize=7)
+            ax1.set_xticklabels([dates[i][5:10] for i in xs[::step]], fontsize=7)
             ax1.set_xlabel("该指数无 5 亿以上场内 ETF，资金与基差维度缺失", fontsize=7, color=SUB)
         c.fig.subplots_adjust(left=0.055, right=0.922, top=0.925, bottom=0.115, hspace=0.14)
+        self.flow_plbl.setText("%s · 近%d根 · 滚轮缩放" % (period, n))
         self._flow_ctx = dict(
-            dates=dates, close=close,
-            mom=[mom.get(d, 0.0) for d in dates] if has_flow else None,
+            dates=dates, close=closes, o=o.tolist(), h=hi.tolist(), l=lo.tolist(),
+            mom=vals if has_flow else None,
             axs=[ax1] + ([ax2] if ax2 is not None else []),
-            name=(m or {}).get("name") or g.get("name") or "")
+            name=(m or {}).get("name") or g.get("name") or "", period=period)
         self._flow_marks = []
         c.draw()
 
@@ -2338,17 +2529,24 @@ class ProWindow(QMainWindow):
         close = ctx["close"][i]
         prev = ctx["close"][i - 1] if i > 0 else close
         chg = (close / prev - 1) * 100 if (prev and close) else 0.0
-        txt = "%s\n收盘 %s   日涨跌 %+.2f%%" % (
-            ctx["dates"][i], "—" if close is None else "%.3f" % close, chg)
-        if ctx.get("mom"):
-            txt += "\n资金动能 %+.2f 亿" % ctx["mom"][i]
+        per = ctx.get("period") or "日K"
+        word = {"日K": "日", "周K": "周", "月K": "月"}.get(per, "")
+        txt = "%s\n开 %.3f  高 %.3f  低 %.3f\n收 %s   %s涨跌 %+.2f%%" % (
+            ctx["dates"][i], ctx["o"][i], ctx["h"][i], ctx["l"][i],
+            "—" if close is None else "%.3f" % close, word, chg)
+        mv = ctx["mom"][i] if ctx.get("mom") else None
+        if mv is not None:
+            txt += "\n5日资金动能 %+.2f 亿" % mv
             # 5日动能是滚动的, 再加一句相对上一根的增减, 看的是加速还是减速
-            if i > 0:
-                txt += " (较前日 %+.2f)" % (ctx["mom"][i] - ctx["mom"][i - 1])
+            mi = i - 1
+            while mi >= 0 and ctx["mom"][mi] is None:
+                mi -= 1
+            if mi >= 0:
+                txt += " (较前一%s %+.2f)" % (word, mv - ctx["mom"][mi])
         right = i > len(ctx["dates"]) * 0.66
         yv = close if close else 0
-        if hit is not ax0 and ctx.get("mom"):
-            yv = ctx["mom"][i]
+        if hit is not ax0 and mv is not None:
+            yv = mv
         box = hit.annotate(txt, xy=(i, yv),
                            xytext=(-9 if right else 9, 4), textcoords="offset points",
                            fontsize=7.6, color=TXT, va="top",
@@ -2360,7 +2558,7 @@ class ProWindow(QMainWindow):
         self.status.setText("%s %s · 收 %s · %+.2f%%%s"
                             % (ctx["name"], ctx["dates"][i],
                                "—" if close is None else "%.3f" % close, chg,
-                               (" · 动能 %+.2f 亿" % ctx["mom"][i]) if ctx.get("mom") else ""))
+                               (" · 动能 %+.2f 亿" % mv) if mv is not None else ""))
 
     def _on_idx_detail_pick(self, idx):
         if 0 <= idx.row() < len(self._det_code):
@@ -2599,8 +2797,85 @@ class ProWindow(QMainWindow):
     # ---------------- 页2: K线 ----------------
     def _on_period_change(self, txt):
         # 分时没有 K 线, 副图指标无处可放, 直接置灰免得误以为坏了
+        self._vis = None          # 手动换周期就从全图重新看起
         self.sub_mode.setEnabled(txt != "分时")
         self.draw_kline()
+
+    # ---- 缩放: 滚轮/上下键沿 PERIODS 连续切档, 与券商软件一致
+    def _period_idx(self):
+        try:
+            return PERIODS.index(self.period_cb.currentText())
+        except (ValueError, AttributeError):
+            return PERIODS.index("日K")
+
+    def _set_period(self, i):
+        i = max(0, min(len(PERIODS) - 1, i))
+        # 跨档时别把更细周期的几百根一次全摊开: 先给 120 根当过渡, 继续滚再缩
+        self._vis = "auto" if i < self._period_idx() else None
+        txt = PERIODS[i]
+        self.period_cb.blockSignals(True)
+        self.period_cb.setCurrentText(txt)
+        self.period_cb.blockSignals(False)
+        self.sub_mode.setEnabled(txt != "分时")
+        self.draw_kline()
+        self.status.setText("周期 → %s" % txt)
+
+    def _zoom(self, d):
+        """d>0 放大(更细的周期/更少的根数), d<0 缩小。
+
+        同一周期内先改可见根数, 到 30 根还不够细就切更细的周期;
+        反过来把本周期全看完还继续缩, 就切更粗的周期。分时已是最细, 不再切。
+        """
+        if not hasattr(self, "period_cb"):
+            return
+        i = self._period_idx()
+        total = int(getattr(self, "_bar_total", 0) or 0)
+        vis = getattr(self, "_vis", None)
+        if vis == "auto":
+            vis = min(total, AUTO_VIS) if total else None
+        if d > 0:
+            if i == 0:                      # 分时无根数可缩, 也不存在更细的档
+                self.status.setText("已经是最细周期: 分时")
+                return
+            if vis is None and total:
+                vis = total
+            if vis:
+                nv = max(min(ZOOM_MIN_BARS, vis),
+                         int(round(vis / ZOOM_RATIO)))
+                if nv < vis:
+                    self._vis = nv
+                    self.draw_kline()
+                    return
+            self._set_period(i - 1)
+            return
+        if vis is None:
+            if i < len(PERIODS) - 1:
+                self._set_period(i + 1)
+            else:
+                self.status.setText("已经是最大周期: 月K")
+            return
+        nv = int(round(vis * ZOOM_RATIO))
+        if nv >= total:
+            if i < len(PERIODS) - 1:
+                self._set_period(i + 1)
+            else:
+                self._vis = None
+                self.draw_kline()
+        else:
+            self._vis = nv
+            self.draw_kline()
+
+    def _kline_scroll(self, ev):
+        if ev.button == "up":
+            self._zoom(1)
+        elif ev.button == "down":
+            self._zoom(-1)
+
+    def _kline_key(self, ev):
+        if ev.key in ("up", "+", "=", "pageup"):
+            self._zoom(1)
+        elif ev.key in ("down", "-", "_", "pagedown"):
+            self._zoom(-1)
 
     def _live_tick(self):
         """停在分时页时每分钟自己重取一次, 跟行情软件一样会动。"""
@@ -2638,6 +2913,7 @@ class ProWindow(QMainWindow):
         ax.text(0.5, 0.56, title, ha="center", va="center", fontsize=13, color=TXT)
         if sub:
             ax.text(0.5, 0.46, sub[:120], ha="center", va="center", fontsize=9, color=SUB)
+        self._bar_total = 0
         self._k_ctx = None
         self._i_ctx = None
         self.kchart.draw()
@@ -2688,10 +2964,24 @@ class ProWindow(QMainWindow):
     def _render_candles(self, ind, code, e, label, unit):
         d = ind.get("sum") or {}
         nm = e["name"] if e else code
+        # 缩放到某一档时只画最后 n 根; 指标在长序列上已经算好, 直接截尾不会错位
+        n_all = len(ind["c"]) if ind.get("c") is not None else 0
+        self._bar_total = n_all
+        vis = getattr(self, "_vis", None)
+        if vis == "auto":
+            vis = min(n_all, AUTO_VIS)
+            self._vis = vis
+        n_show = n_all if not vis else max(ZOOM_MIN_BARS, min(n_all, int(vis)))
+        if n_show < n_all:
+            st = n_all - n_show
+            ind = {k: (v[st:] if isinstance(v, (list, np.ndarray)) and len(v) == n_all
+                       else v) for k, v in ind.items()}
+            unit = "近%d/%d" % (n_show, n_all)
         if label == "日K" and d.get("rsi") is not None:
             self.kinfo.setText(
                 f"  {nm} ({code}) · RSI {d['rsi']:.0f} · 20日 {d['r20']:+.1f}% · "
-                f"年内 {d['ytd']:+.1f}% · 距52周高点 {d['offHi']:+.1f}%")
+                f"年内 {d['ytd']:+.1f}% · 距52周高点 {d['offHi']:+.1f}%"
+                + ("　%s" % unit if n_show < n_all else ""))
         else:
             last = ind["c"][-1]
             prev = ind["c"][-2] if len(ind["c"]) > 1 else last
@@ -2826,6 +3116,7 @@ class ProWindow(QMainWindow):
         nm = e["name"] if e else code
         c = d["c"]
         n = len(c)
+        self._bar_total = n
         if n < 2:
             self._placeholder("分时数据为空", "%s 当日没有成交" % code)
             return

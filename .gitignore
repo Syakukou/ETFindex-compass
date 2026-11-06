@@ -47,3 +47,7 @@ shot_hold4.png
 
 # 图标生成过程中的中间尺寸，只留 ico 与预览
 icons/icon_*_[0-9]*.png
+
+# ---- 本地验证脚本与截图 ----
+_t_*.py
+_shots/
