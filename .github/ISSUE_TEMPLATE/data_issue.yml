@@ -1,5 +1,5 @@
-name: 数据不对 / 数字可疑
-description: 某个 ETF 的数值和行情软件、基金公告对不上
+name: 数据对不上
+description: 某只 ETF 的数值和行情软件、基金公告不一致
 title: "[数据] "
 labels: ["bug"]
 body:
@@ -9,20 +9,24 @@ body:
         这类问题靠复现，信息越具体越好处理。
 
         先排除两种情况：
-        **① 时效差** — 份额、规模类字段更新频率低于行情，盘中取到的日线是未完成数据；
-        **② 披露规则** — 季报只披露前十大重仓，所以某只 ETF 明细只有 10 到 15 行属正常，
-        切到中报、年报那一期才有全量。
+        **时效差** —— 份额、规模类字段更新频率低于行情，盘中取到的日线是未完成数据；
+        **披露规则** —— 季报只披露前十大重仓，某只 ETF 明细只有 10 到 15 行属正常，切到中报、年报那一期才有全量。
+
+        另外，资金流、主力净流入这类字段是接口方算法，不做二次加工，
+        不同软件口径不同是常态。但如果是明显错位（昨天显示今天的数、涨跌幅符号反了、
+        某只 ETF 的数据串到别只身上），那就是程序问题，照实填即可。
 
   - type: input
     id: version
     attributes:
       label: 版本号
+      description: 窗口标题最右边的 v1.0.x
       placeholder: v1.0.4
     validations:
       required: true
 
   - type: input
-    id: code
+    id: codes
     attributes:
       label: ETF 代码
       description: 6 位代码，多只就用逗号隔开
@@ -46,7 +50,7 @@ body:
       required: true
 
   - type: input
-    id: date
+    id: trade_date
     attributes:
       label: 哪一天的数
       description: 界面上显示的数据日期，不是你今天打开的时间
@@ -57,26 +61,28 @@ body:
   - type: textarea
     id: detail
     attributes:
-      label: 看到什么 / 期望什么
-      description: 三句话讲清：界面显示多少、你以为应该是多少、依据是什么（哪个软件、哪份公告）
+      label: 看到什么，以为是什么
+      description: 界面显示多少、你以为应该是多少、依据是什么（哪个软件、哪份公告）
       placeholder: |
         界面显示 510300 的 5 日资金动能为 -3.2 亿；
-        某行情软件显示 -1.8 亿。依据是那家软件的「资金流向」页 11 月 5 日数据。
+        某行情软件显示 -1.8 亿，依据是该软件「资金流向」页 11 月 5 日数据。
     validations:
       required: true
 
   - type: textarea
-    id: shot
+    id: shots
     attributes:
       label: 截图
       description: 界面截图，以及你认为正确的来源截图，两张放一起最省事
     validations:
       required: false
 
-  - type: markdown
+  - type: checkboxes
+    id: checked
     attributes:
-      value: |
-        > 说明：本项目的资金流、主力净流入等字段是接口方算法，不做二次加工，
-        > 不同软件口径不同是常态，不保证与任何第三方一致。
-        > 但如果是**明显错位**（比如昨天显示今天的数、涨跌幅符号反了、某只 ETF 数据串到别只身上），
-        > 那确实是程序问题，请照实填。
+      label: 提交前确认
+      options:
+        - label: 已经排除时效差，数据日期对得上
+          required: false
+        - label: 已经排除披露规则，不是季报只披露前十大那种情况
+          required: false
