@@ -24,7 +24,7 @@ BASE = (Path(_sys.executable).resolve().parent if getattr(_sys, "frozen", False)
         else Path(__file__).resolve().parent)
 DB = BASE / "etf_tracker.db"
 CONFIG = BASE / "etf_list.json"
-KLINE_DAYS = 300  # 保留约 14 个月日K
+KLINE_DAYS = 480  # 保留约两年日K, 周K/月K 才够画
 
 COLUMNS = """CREATE TABLE IF NOT EXISTS snapshot (
     trade_date TEXT NOT NULL, code TEXT NOT NULL, name TEXT,

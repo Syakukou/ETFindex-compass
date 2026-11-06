@@ -12,7 +12,7 @@ import os
 PUBLISH = os.environ.get("ETF_PUBLISH") == "1"
 
 # 打包版靠这个区分构建, 出问题时报一句版本号就能定位是哪一版
-VERSION = "v1.0.3"
+VERSION = "v1.0.4"
 
 if PUBLISH:
     NAME = "指数罗盘"

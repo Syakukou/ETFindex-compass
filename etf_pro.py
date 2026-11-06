@@ -18,6 +18,7 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
+from matplotlib.ticker import FuncFormatter
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtGui import QColor, QFont, QAction, QIcon
@@ -49,13 +50,14 @@ def _restore_stdio():
 
 
 _restore_stdio()
-from etf_analytics import Analyzer  # noqa: E402
+from etf_analytics import Analyzer, full_ind  # noqa: E402
 from etf_meta import looks_qdii  # noqa: E402
 import etf_app  # noqa: E402
 from etf_app import refresh_data    # noqa: E402
 import etf_flow  # noqa: E402
 import etf_hold  # noqa: E402
 import etf_inst  # noqa: E402
+import etf_minute  # noqa: E402
 
 # 主题与品牌: 自用版 / 发布版共用一套逻辑, 外观由 brand 决定
 import brand  # noqa: E402
@@ -75,6 +77,57 @@ DARK_RC = {
     "axes.titlesize": 11, "xtick.labelsize": 8, "ytick.labelsize": 8,
 }
 plt.rcParams.update(DARK_RC)
+
+# 走势页的周期选项 → 分钟接口的 period 参数
+PERIOD_MIN = {"5分钟": "5", "15分钟": "15", "30分钟": "30", "60分钟": "60"}
+
+
+def _fmt_vol(y, _pos=None):
+    """成交量刻度: 用万/亿, 免得出现 1e7 那种科学计数。"""
+    try:
+        y = float(y)
+    except Exception:
+        return ""
+    if abs(y) >= 1e8:
+        return "%.1f亿" % (y / 1e8)
+    if abs(y) >= 1e4:
+        return "%.0f万" % (y / 1e4)
+    return "%.0f" % y
+
+
+def _fmt_bar_label(s, label):
+    """分钟线横轴带时分, 月K只留年月, 其余用完整日期。"""
+    s = str(s)
+    if "分钟" in label and len(s) >= 16:
+        return s[5:16]
+    if label == "月K":
+        return s[:7]
+    return s
+
+
+def _intraday_ticks(times):
+    """分时横轴刻度: 09:30 / 10:30 / 11:30-13:00 / 14:00 / 15:00。
+
+    用分钟数就近取命中位置, 5分钟线的时间戳是 09:35 这种, 不能按字符串相等匹配。
+    """
+    targets = [(9, 30, "09:30"), (10, 30, "10:30"), (11, 30, "11:30/13:00"),
+               (14, 0, "14:00"), (15, 0, "15:00")]
+
+    def _m(t):
+        try:
+            return int(str(t)[11:13]) * 60 + int(str(t)[14:16])
+        except Exception:
+            return None
+
+    ms = [_m(t) for t in times]
+    idx, labs = [], []
+    for hh, mm, lab in targets:
+        want = hh * 60 + mm
+        hit = next((i for i, m in enumerate(ms) if m is not None and m >= want), None)
+        if hit is not None and hit not in idx:
+            idx.append(hit)
+            labs.append(lab)
+    return idx, labs
 
 QSS = f"""
 QMainWindow, QWidget {{ background: {BG}; color: {TXT}; font-size: 12px; }}
@@ -236,6 +289,24 @@ class InstThread(QThread):
         self.done.emit(n1, n2, errs)
 
 
+class MinuteThread(QThread):
+    """分钟/分时取数。网络慢时不至于把界面卡住。"""
+    done = Signal(str, str, object)
+
+    def __init__(self, code, period, db):
+        super().__init__()
+        self.code = code
+        self.period = str(period)
+        self.db = db
+
+    def run(self):
+        try:
+            d = etf_minute.fetch(self.code, self.period, self.db)
+        except Exception as e:
+            d = {"err": "%s: %s" % (type(e).__name__, e)}
+        self.done.emit(self.code, self.period, d)
+
+
 class ChartWidget(QWidget):
     """matplotlib 画布 + 工具栏封装"""
     def __init__(self, figsize=(9, 6), toolbar=True):
@@ -378,10 +449,18 @@ class ProWindow(QMainWindow):
         lw = QWidget(); lw.setLayout(left); lw.setMaximumWidth(270)
         lay.addWidget(lw)
         right = QVBoxLayout()
+        self.period_cb = QComboBox()
+        self.period_cb.addItems(["分时", "5分钟", "15分钟", "30分钟",
+                                 "60分钟", "日K", "周K", "月K"])
+        self.period_cb.setCurrentText("日K")
+        self.period_cb.currentTextChanged.connect(self._on_period_change)
         self.sub_mode = QComboBox()
         self.sub_mode.addItems(["MACD", "RSI", "KDJ"])
         self.sub_mode.currentTextChanged.connect(lambda _: self.draw_kline())
         top = QHBoxLayout()
+        top.addWidget(QLabel("周期:"))
+        top.addWidget(self.period_cb)
+        top.addSpacing(10)
         top.addWidget(QLabel("副图:"))
         top.addWidget(self.sub_mode)
         top.addStretch(1)
@@ -391,11 +470,21 @@ class ProWindow(QMainWindow):
         right.addLayout(top)
         self.kchart = ChartWidget(figsize=(10, 7))
         self.kchart.canvas.mpl_connect("button_press_event", self._kline_click)
+        self.kchart.canvas.mpl_connect("button_press_event", self._intraday_click)
         self._k_ctx = None
+        self._i_ctx = None
+        self._mdata = {}       # (code, period) -> 已取到的分钟数据
+        self._mthread = None   # 只保留最新一次请求, 防止连点刷屏
         right.addWidget(self.kchart, 1)
         rw = QWidget(); rw.setLayout(right)
         lay.addWidget(rw, 1)
         self.tabs.addTab(w, brand.TABS["kline"])
+
+        # 分时是活的: 停在这一页且选着分时时, 每分钟重取一次
+        self._live = QTimer(self)
+        self._live.setInterval(60000)
+        self._live.timeout.connect(self._live_tick)
+        self._live.start()
 
     def _tab_corr(self):
         w = QWidget()
@@ -2508,12 +2597,61 @@ class ProWindow(QMainWindow):
         self.draw_kline()
 
     # ---------------- 页2: K线 ----------------
-    def draw_kline(self):
+    def _on_period_change(self, txt):
+        # 分时没有 K 线, 副图指标无处可放, 直接置灰免得误以为坏了
+        self.sub_mode.setEnabled(txt != "分时")
+        self.draw_kline()
+
+    def _live_tick(self):
+        """停在分时页时每分钟自己重取一次, 跟行情软件一样会动。"""
         code = getattr(self, "cur_code", None)
-        if not code:
+        if not code or self.period_cb.currentText() != "分时":
+            return
+        if self.tabs.tabText(self.tabs.currentIndex()) != brand.TABS["kline"]:
+            return
+        key = (code, "1")
+        if key not in self._mdata:      # 上次就没取到, 别反复打接口
+            return
+        etf_minute.clear_cache(code)
+        self._request_minute(code, "1", None, quiet=True, force=True)
+
+    def draw_kline(self):
+        """按周期分发: 分时 / 分钟K / 日K / 周K / 月K。"""
+        code = getattr(self, "cur_code", None)
+        if not code or not getattr(self, "analyzer", None):
             return
         e = next((x for x in self.analyzer.etfs if x["code"] == code), None)
-        ind = self.analyzer.ind.get(code)
+        p = self.period_cb.currentText() if hasattr(self, "period_cb") else "日K"
+        if p == "分时":
+            self._request_minute(code, "1", e)
+        elif p in ("日K", "周K", "月K"):
+            self._draw_candles(code, e, p)
+        else:
+            self._request_minute(code, PERIOD_MIN.get(p, "5"), e)
+
+    # ---------- 通用提示页 ----------
+    def _placeholder(self, title, sub=""):
+        fig = self.kchart.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.axis("off")
+        ax.text(0.5, 0.56, title, ha="center", va="center", fontsize=13, color=TXT)
+        if sub:
+            ax.text(0.5, 0.46, sub[:120], ha="center", va="center", fontsize=9, color=SUB)
+        self._k_ctx = None
+        self._i_ctx = None
+        self.kchart.draw()
+
+    # ---------- 日/周/月 K ----------
+    def _draw_candles(self, code, e, label):
+        rows = self.analyzer.kline.get(code) or []
+        if label == "日K":
+            ind = self.analyzer.ind.get(code)
+            if ind is None and len(rows) >= 30:
+                ind = full_ind(rows)
+        else:
+            merged = etf_minute.resample(rows, "W" if label == "周K" else "M")
+            ind = full_ind(merged) if len(merged) >= 12 else None
         if not ind:
             fig = self.kchart.fig
             fig.clear()
@@ -2531,11 +2669,23 @@ class ProWindow(QMainWindow):
             self._k_ctx = None
             self.kchart.draw()
             return
-        d = ind["sum"]
-        self.kinfo.setText(
-            f"  {e['name']} ({code}) · RSI {d['rsi']:.0f} · 20日 {d['r20']:+.1f}% · "
-            f"年内 {d['ytd']:+.1f}% · 距52周高点 {d['offHi']:+.1f}%"
-            if d.get("rsi") is not None else e["name"])
+        self._render_candles(ind, code, e, label,
+                             "%d根" % len(ind["c"]) if label != "日K"
+                             else "%d个交易日" % len(ind["c"]))
+
+    def _render_candles(self, ind, code, e, label, unit):
+        d = ind.get("sum") or {}
+        nm = e["name"] if e else code
+        if label == "日K" and d.get("rsi") is not None:
+            self.kinfo.setText(
+                f"  {nm} ({code}) · RSI {d['rsi']:.0f} · 20日 {d['r20']:+.1f}% · "
+                f"年内 {d['ytd']:+.1f}% · 距52周高点 {d['offHi']:+.1f}%")
+        else:
+            last = ind["c"][-1]
+            prev = ind["c"][-2] if len(ind["c"]) > 1 else last
+            self.kinfo.setText("  %s (%s) · %s · %s · 最新 %.3f (%+.2f%%)"
+                               % (nm, code, label, unit, last,
+                                  (last / prev - 1) * 100 if prev else 0.0))
         fig = self.kchart.fig
         fig.clear()
         ax_k = fig.add_axes((0.055, 0.40, 0.92, 0.56))
@@ -2548,16 +2698,20 @@ class ProWindow(QMainWindow):
         ax_k.vlines(x, l, h, color=colors, lw=0.7)
         ax_k.bar(x, np.abs(c - o) + 1e-9, 0.65, bottom=np.minimum(o, c),
                  color=colors, zorder=3)
-        for arr, colr, lab in ((ind["ma5"], "#f5a623", "MA5"), (ind["ma20"], ACCENT, "MA20"),
+        for arr, colr, lab in ((ind["ma5"], "#f5a623", "MA5"),
+                               (ind["ma20"], ACCENT, "MA20"),
                                (ind["ma60"], "#9b59b6", "MA60")):
-            ax_k.plot(x, arr, lw=1, color=colr, label=lab)
+            # 月K 只有十几根, MA60 全是空值, 别在图例里挂一条不存在的线
+            if np.isfinite(arr).any():
+                ax_k.plot(x, arr, lw=1, color=colr, label=lab)
         ax_k.plot(x, ind["boll_up"], lw=0.8, ls="--", color="#5a6070", label="BOLL上")
         ax_k.plot(x, ind["boll_low"], lw=0.8, ls="--", color="#5a6070", label="BOLL下")
         ax_k.legend(loc="upper left", fontsize=8, ncol=5, frameon=False)
-        ax_k.set_title(f"{e['name']} ({code})  日K · {n}个交易日", loc="left", fontsize=11)
+        ax_k.set_title(f"{nm} ({code})  {label} · {unit}", loc="left", fontsize=11)
         ax_k.grid(color=GRID, lw=0.5)
         ax_k.tick_params(labelbottom=False)
         ax_v.bar(x, v, color=colors, width=0.65)
+        ax_v.yaxis.set_major_formatter(FuncFormatter(_fmt_vol))
         ax_v.set_ylabel("成交量", fontsize=8)
         ax_v.tick_params(labelbottom=False)
         ax = ax_s
@@ -2566,6 +2720,8 @@ class ProWindow(QMainWindow):
             ax.bar(x, ind["hist"], color=np.where(ind["hist"] >= 0, UP, DOWN), width=0.65)
             ax.plot(x, ind["dif"], lw=1, color="#f5a623", label="DIF")
             ax.plot(x, ind["dea"], lw=1, color=ACCENT, label="DEA")
+            ax.legend(loc="upper left", fontsize=8, ncol=2, frameon=False)
+            ax.set_ylabel("MACD", fontsize=8)
         elif mode == "RSI":
             ax.plot(x, ind["rsi"], lw=1.1, color="#9b59b6")
             ax.axhline(70, color=UP, ls="--", lw=0.7)
@@ -2578,21 +2734,192 @@ class ProWindow(QMainWindow):
             ax.plot(x, ind["J"], lw=1, color="#9b59b6", label="J")
             ax.legend(loc="upper left", fontsize=8, ncol=3, frameon=False)
             ax.set_ylabel("KDJ", fontsize=8)
-        if mode == "MACD":
-            ax.legend(loc="upper left", fontsize=8, ncol=2, frameon=False)
-            ax.set_ylabel("MACD", fontsize=8)
         ax.grid(color=GRID, lw=0.5)
-        step = max(1, n // 10)
+        if "分钟" in label:
+            want = 8
+        elif label in ("周K", "月K"):
+            want = 6
+        else:
+            want = 10
+        step = max(1, n // want)
         ticks = list(range(0, n, step))
         ax.set_xticks(ticks)
-        ax.set_xticklabels([ind["dates"][i] for i in ticks], fontsize=7)
+        ax.set_xticklabels([_fmt_bar_label(ind["dates"][i], label) for i in ticks],
+                           fontsize=7)
+        if "分钟" in label:
+            for lab in ax.get_xticklabels():
+                lab.set_rotation(0)
+                lab.set_ha("center")
         for a_ in (ax_k, ax_v, ax):
             a_.set_xlim(-1, n)
         self._k_ctx = dict(dates=ind["dates"], o=o, c=c, h=h, l=l, v=v, n=n,
-                           ax=ax_k, axs=(ax_k, ax_v, ax), code=code, name=e["name"],
+                           ax=ax_k, axs=(ax_k, ax_v, ax), code=code, name=nm,
                            ma5=ind["ma5"], ma20=ind["ma20"], ma60=ind["ma60"])
+        self._i_ctx = None
         self._k_marks = []
         self.kchart.draw()
+
+    # ---------- 分时 / 分钟线取数 ----------
+    def _request_minute(self, code, period, e, quiet=False, force=False):
+        key = (code, period)
+        if not force:
+            d = self._mdata.get(key)
+            if d:
+                self._show_minute(code, e, period, d)
+                return
+        if not quiet:
+            self._placeholder("正在取分钟行情…",
+                              "%s · %s" % (code, "分时" if period == "1"
+                                           else period + "分钟K"))
+        th = MinuteThread(code, period, str(etf_app.DB))
+        th.done.connect(self._on_minute_done)
+        self._mthread = th
+        th.start()
+
+    def _on_minute_done(self, code, period, d):
+        key = (code, period)
+        if "err" in d:
+            # 自动刷新失败时保留原来那张图, 不要把画面换成错误页
+            if key not in self._mdata:
+                self._placeholder("分钟行情取不到", d["err"])
+            self.status.setText("分钟行情失败: %s" % d["err"])
+            return
+        self._mdata[(code, period)] = d
+        if code != getattr(self, "cur_code", None):
+            return
+        p = self.period_cb.currentText()
+        if period == "1" and p != "分时":
+            return
+        if period != "1" and PERIOD_MIN.get(p) != period:
+            return
+        e = next((x for x in self.analyzer.etfs if x["code"] == code), None)
+        self._show_minute(code, e, period, d)
+
+    def _show_minute(self, code, e, period, d):
+        if e is None and getattr(self, "analyzer", None):
+            e = next((x for x in self.analyzer.etfs if x["code"] == code), None)
+        if period == "1":
+            self._render_intraday(code, e, d)
+        else:
+            rows = [(t, o_, c_, h_, l_, v_, 0.0) for t, o_, c_, h_, l_, v_
+                    in zip(d["times"], d["o"], d["c"], d["h"], d["l"], d["v"])]
+            if len(rows) < 12:
+                self._placeholder("分钟K太少", "该标的成交清淡, 暂无足够的分钟数据")
+                return
+            self._render_candles(full_ind(rows), code, e, period + "分钟K",
+                                 "%d根" % len(rows))
+
+    # ---------- 分时图 ----------
+    def _render_intraday(self, code, e, d):
+        nm = e["name"] if e else code
+        c = d["c"]
+        n = len(c)
+        if n < 2:
+            self._placeholder("分时数据为空", "%s 当日没有成交" % code)
+            return
+        pc = d["prev_close"] or float(c[0])
+        avg = d["avg"]
+        x = np.arange(n)
+        up = c[-1] >= pc
+        line = UP if up else DOWN
+        pct = (c[-1] / pc - 1) * 100 if pc else 0.0
+        self.kinfo.setText("  %s (%s) · 分时 · 现价 %.3f (%+.2f%%) · 均价 %.3f · %s"
+                           % (nm, code, c[-1], pct,
+                              float(avg[-1]) if avg is not None else c[-1],
+                              d.get("updated", "")))
+
+        fig = self.kchart.fig
+        fig.clear()
+        ax_p = fig.add_axes((0.075, 0.31, 0.845, 0.64))
+        ax_v = fig.add_axes((0.075, 0.11, 0.845, 0.16), sharex=ax_p)
+
+        # 上下对称, 昨收压在正中间, 涨跌幅刻度才不会偏
+        dev = float(np.max(np.abs(c - pc)))
+        if avg is not None:
+            dev = max(dev, float(np.max(np.abs(avg - pc))))
+        dev = max(dev, pc * 0.002)
+        lo, hi = pc - dev * 1.14, pc + dev * 1.14
+        ax_p.set_ylim(lo, hi)
+        ax_p.set_xlim(-1, max(n, 240))
+
+        ax_p.plot(x, c, lw=1.1, color=line, label="价格", zorder=3)
+        # 填到画布底部, 别用昨收做基线, 否则一半画布糊成一整块
+        ax_p.fill_between(x, c, lo, color=line, alpha=0.10, lw=0, zorder=2)
+        if avg is not None:
+            ax_p.plot(x, avg, lw=1.0, color="#f5a623", label="均价", zorder=4)
+        ax_p.axhline(pc, color=SUB, ls="--", lw=0.8, zorder=1)
+        ax_p.grid(color=GRID, lw=0.5)
+        ax_p.tick_params(labelbottom=False)
+        ax_p.legend(loc="upper left", fontsize=8, ncol=2, frameon=False)
+        ax_p.set_title("%s (%s)  分时 · %s" % (nm, code, d.get("date", "")),
+                       loc="left", fontsize=11)
+
+        # 右轴换成涨跌幅, 和券商软件一致。刻度必须落在可视范围内,
+        # 否则 get_yticks() 多出来的两端刻度会和左轴错位。
+        ax_r = ax_p.twinx()
+        ax_r.set_ylim(lo, hi)
+        yticks = [t for t in ax_p.get_yticks() if lo <= t <= hi]
+        ax_p.set_yticks(yticks)
+        ax_r.set_yticks(yticks)
+        ax_r.set_yticklabels(["%+.2f%%" % ((y / pc - 1) * 100) for y in yticks], fontsize=8)
+        ax_r.tick_params(colors=SUB, length=0)
+        for sp in ("top", "right"):
+            ax_r.spines[sp].set_visible(False)
+
+        # 成交量: 按这一分钟相对上一分钟的涨跌染色
+        dc = np.diff(c, prepend=c[0])
+        ax_v.bar(x, d["v"], width=0.7,
+                 color=np.where(dc >= 0, UP, DOWN), alpha=0.85)
+        ax_v.yaxis.set_major_formatter(FuncFormatter(_fmt_vol))
+        ax_v.set_ylabel("成交量", fontsize=8)
+        ax_v.grid(color=GRID, lw=0.5)
+        idx, labs = _intraday_ticks(d["times"])
+        ax_v.set_xticks(idx)
+        ax_v.set_xticklabels(labs, fontsize=7.5)
+
+        self._i_ctx = dict(code=code, name=nm, times=d["times"], c=c,
+                           avg=avg, v=d["v"], n=n, pc=pc,
+                           ax=ax_p, axs=(ax_p, ax_v))
+        self._k_ctx = None
+        self._k_marks = []
+        self.kchart.draw()
+
+    def _intraday_click(self, ev):
+        """点分时任一点: 竖线 + 时间/价格/涨跌幅/均价/成交量。"""
+        ctx = getattr(self, "_i_ctx", None)
+        if not ctx or ev.xdata is None:
+            return
+        if not hit_axs(ev, ctx["axs"]):
+            return
+        i = int(round(ev.xdata))
+        if not (0 <= i < ctx["n"]):
+            return
+        for art in getattr(self, "_k_marks", []):
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._k_marks = []
+        ax = ctx["ax"]
+        ln = ax.axvline(i, color=ACCENT, lw=0.9, alpha=0.9, zorder=8)
+        pc = ctx["pc"] or 1.0
+        pct = (ctx["c"][i] / pc - 1) * 100 if pc else 0.0
+        avg = ctx["avg"]
+        a_ = "—" if avg is None else "%.3f" % float(avg[i])
+        txt = ("%s\n价 %.3f   涨跌 %+.2f%%\n均价 %s   量 %.0f"
+               % (ctx["times"][i][11:16], ctx["c"][i], pct, a_, ctx["v"][i]))
+        right = i > ctx["n"] * 0.66
+        box = ax.annotate(txt, xy=(i, ctx["c"][i]),
+                          xytext=(-10 if right else 10, 12), textcoords="offset points",
+                          fontsize=7.8, color=TXT, va="bottom",
+                          ha="right" if right else "left",
+                          bbox=dict(boxstyle="round,pad=0.42", fc=PANEL2, ec=ACCENT,
+                                    lw=0.8, alpha=0.96), zorder=9)
+        self._k_marks = [ln, box]
+        self.kchart.draw()
+        self.status.setText("%s %s · %.3f (%+.2f%%) · 均价 %s · 量 %.0f"
+                            % (ctx["code"], ctx["times"][i][11:16],
+                               ctx["c"][i], pct, a_, ctx["v"][i]))
 
     def _kline_click(self, ev):
         """点 K 线任意位置: 竖线定位 + 当日开高低收/涨跌/量/均线数值。"""
