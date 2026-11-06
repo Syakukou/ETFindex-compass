@@ -2651,7 +2651,8 @@ class ProWindow(QMainWindow):
                 ind = full_ind(rows)
         else:
             merged = etf_minute.resample(rows, "W" if label == "周K" else "M")
-            ind = full_ind(merged) if len(merged) >= 12 else None
+            need = 12 if label == "周K" else 6
+            ind = full_ind(merged) if len(merged) >= need else None
         if not ind:
             fig = self.kchart.fig
             fig.clear()
@@ -2659,13 +2660,24 @@ class ProWindow(QMainWindow):
             ax.axis("off")
             nm = e["name"] if e else code
             note = (e.get("note") or "") if e else ""
-            ax.text(0.5, 0.62, nm, ha="center", va="center", fontsize=15, color=TXT)
-            ax.text(0.5, 0.52, "%s  ·  暂无场内 K 线" % code, ha="center", va="center",
-                    fontsize=10, color=SUB)
-            ax.text(0.5, 0.40, "新成立/未上市的基金，交易所还没有连续行情。\n"
-                              "%s\n上市后点「刷新数据」，日K与资金流会自动补上。" % note,
-                    ha="center", va="center", fontsize=9, color=SUB, linespacing=1.7)
-            self.kinfo.setText("  %s (%s) · 待上市" % (nm, code))
+            if rows and label != "日K":
+                # 有日K但不够合成周/月K, 别说成"待上市"
+                ax.text(0.5, 0.60, nm, ha="center", va="center", fontsize=15, color=TXT)
+                ax.text(0.5, 0.50, "%s  ·  %s 历史不足" % (code, label),
+                        ha="center", va="center", fontsize=10, color=SUB)
+                ax.text(0.5, 0.38, "库里只有 %d 根日K，合成%s至少需要 %d 根。\n"
+                                  "点「刷新数据」补历史，或先看日K。"
+                        % (len(rows), label, need),
+                        ha="center", va="center", fontsize=9, color=SUB, linespacing=1.7)
+                self.kinfo.setText("  %s (%s) · %s 历史不足" % (nm, code, label))
+            else:
+                ax.text(0.5, 0.62, nm, ha="center", va="center", fontsize=15, color=TXT)
+                ax.text(0.5, 0.52, "%s  ·  暂无场内 K 线" % code, ha="center", va="center",
+                        fontsize=10, color=SUB)
+                ax.text(0.5, 0.40, "新成立/未上市的基金，交易所还没有连续行情。\n"
+                                  "%s\n上市后点「刷新数据」，日K与资金流会自动补上。" % note,
+                        ha="center", va="center", fontsize=9, color=SUB, linespacing=1.7)
+                self.kinfo.setText("  %s (%s) · 待上市" % (nm, code))
             self._k_ctx = None
             self.kchart.draw()
             return
