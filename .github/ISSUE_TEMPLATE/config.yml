@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用说明与数据口径
+    url: https://github.com/Syakukou/ETFindex-compass#readme
+    about: 装不上、数字对不上、某只 ETF 只有十几行持仓，答案多半已经写在 README 里
+  - name: 下载最新版本
+    url: https://github.com/Syakukou/ETFindex-compass/releases/latest
+    about: Windows 免安装包。请先完整解压，不要在压缩包预览窗口里直接双击 exe

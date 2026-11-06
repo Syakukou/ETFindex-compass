@@ -2,6 +2,7 @@
 
 [![build](https://github.com/Syakukou/ETFindex-compass/actions/workflows/build.yml/badge.svg)](https://github.com/Syakukou/ETFindex-compass/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/Syakukou/ETFindex-compass)](https://github.com/Syakukou/ETFindex-compass/releases)
+[![downloads](https://img.shields.io/github/downloads/Syakukou/ETFindex-compass/total)](https://github.com/Syakukou/ETFindex-compass/releases)
 [![license](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
 A 股场内 ETF 的监测工具。覆盖 168 只 ETF 的评分、分时与多周期 K 线、相关性、风险收益、板块轮动、资金流与持仓穿透。PySide6 + matplotlib 单机运行，数据由本机向公开行情接口实时请求，不上传任何本地数据。
@@ -107,6 +108,28 @@ python etf_desktop.py    # Tkinter 轻量版
 **数字和行情软件对不上。** 优先怀疑时间差和接口口径。资金流、份额类字段各家算法不同，不保证一致。
 
 **某只 ETF 完全没有持仓明细。** 见上一节，货币、商品、跨境类本来就没有股票持仓。
+
+## 反馈与提问
+
+提之前先翻一眼上面「数据口径」和「常见问题」两节，一半的问题在那儿已经有答案，尤其是持仓只有十几行、数字和行情软件对不上这两类。
+
+**技术问题走 Issues**：[新建 Issue](https://github.com/Syakukou/ETFindex-compass/issues/new/choose)。点进去有三个模板，按情况选：
+
+| 模板 | 用在什么时候 | 必须带的信息 |
+|---|---|---|
+| 报错 / 闪退 / 拉不到数据 | 弹窗报错、进程直接退出、价格列全是「—」、标的只剩几只 | 版本号、系统、运行方式、现象描述、`refresh.log` 最后 20 行 |
+| 数据不对 / 数字可疑 | 某只 ETF 的数值与公告或行情软件明显不符 | 代码、页签、数据日期、界面显示多少、你认为应该是多少、依据 |
+| 功能建议 | 想要某个功能，或某处用起来别扭 | 使用场景、现在怎么绕过、期望的样子 |
+
+版本号在**窗口标题最右边**，形如 `v1.0.4`，报错弹窗的第一行也带。`refresh.log` 在 exe 同一个目录下，用记事本打开即可。没有这两个信息，只能靠猜是哪一版出的问题，来回问答会拖很久。
+
+**不适合公开贴的内容**：公众号「心镜不语悔不过」后台留言。装不上、看不懂界面这类问题在那儿问也行，只是没法贴日志和截图，排查效率低一些。
+
+**先搜一下再提**：Issues 页面右上角的搜索框会连已关闭的一起搜，很多问题已经有人问过。
+
+**明确不做的**：荐股、评级、目标价、买卖点、仓位建议；自动交易、券商接口对接、实盘下单；代抓数据或对外分发数据。这几类不用提，方向就不对。
+
+**响应**：个人维护，不保证响应时效，也不承诺每条建议都实现。能复现的会修；属于数据口径而非程序错误的，会补进上面「数据口径」一节，不再单独回。
 
 ## 打包
 

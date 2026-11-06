@@ -1,0 +1,49 @@
+name: 功能建议
+description: 想要某个功能，或者觉得某处用起来别扭
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        建议按「场景」写，不要只写「加个 XX 功能」。
+        同样一句需求，说清在什么场景下用、现在怎么绕过去的，我才能判断值不值得做。
+
+  - type: textarea
+    id: scene
+    attributes:
+      label: 使用场景
+      description: 你在做什么事的时候觉得缺这个
+      placeholder: |
+        每天收盘后要挑出当周资金持续流入、但评分还没起来的品种，
+        现在只能一页页翻，没法按「连续 N 日为正」筛。
+    validations:
+      required: true
+
+  - type: textarea
+    id: now
+    attributes:
+      label: 现在怎么绕过
+      description: 没有这个功能的时候你怎么办，写「没办法」也可以
+      placeholder: 导出到 Excel 自己加一列算。
+    validations:
+      required: false
+
+  - type: textarea
+    id: want
+    attributes:
+      label: 期望的样子
+      description: 落在哪个页签、加什么控件、大概怎么操作。有草图更好
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 先确认一下范围
+      description: 下面这几类明确不做，勾选前请先看一眼
+      options:
+        - label: 我知道本项目不提供荐股、评级、目标价、买卖点与仓位建议，这类需求不会实现
+          required: true
+        - label: 我知道本项目不做自动交易、券商接口对接、策略回测下单
+          required: false

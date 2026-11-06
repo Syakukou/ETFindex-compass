@@ -1,0 +1,95 @@
+name: 报错 / 闪退 / 拉不到数据
+description: 程序崩溃、弹窗报错、行情或资金流一片「—」
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        版本号决定排查方向，请务必填。位置：**窗口标题最右边**（形如 `v1.0.4`），
+        或者报错弹窗的第一行。
+
+        提之前先看一眼 README 的「数据口径」和「常见问题」两节，
+        那里写了缺失值和空行大多是披露规则或接口口径，不是程序坏了。
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本号
+      description: 窗口标题最右边的 v1.0.x，或报错弹窗第一行。填了才能定位是哪一版构建
+      placeholder: v1.0.4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 系统
+      options:
+        - Windows 11
+        - Windows 10
+        - Windows 8.1 / 7
+        - macOS
+        - Linux
+        - 其他
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how
+    attributes:
+      label: 怎么运行的
+      options:
+        - Releases 下载的压缩包，解压后双击 exe
+        - 压缩包里直接双击 exe（没解压）
+        - 源码运行 python etf_pro.py
+        - 源码运行 python etf_pub.py
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 点了什么、期望发生什么、实际发生什么。如果有报错弹窗，把弹窗文字抄下来或截图
+      placeholder: |
+        点「更新数据」后弹窗提示「行情快照失败」，价格列全是 —，标的只有 9 只。
+    validations:
+      required: true
+
+  - type: input
+    id: when
+    attributes:
+      label: 大概时间
+      description: 出问题的时间点，盘中和收盘后的问题不一样
+      placeholder: 2026-11-06 15:20 左右
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: refresh.log
+      description: 在 exe 同一个目录下，用记事本打开，把最后 20 行贴进来。没有这个文件就写「无」
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: shot
+    attributes:
+      label: 截图
+      description: 直接把图片拖进这个框。有报错弹窗的优先贴弹窗
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: precheck
+    attributes:
+      label: 确认
+      options:
+        - label: 已解压完整后再运行，不是在压缩包预览窗口里双击
+          required: false
+        - label: 已经关掉所有旧窗口，只跑一个实例
+          required: false
