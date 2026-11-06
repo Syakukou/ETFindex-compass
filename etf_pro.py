@@ -2438,9 +2438,11 @@ class ProWindow(QMainWindow):
                         width=0.7, alpha=0.85, label=lab)
                 # 前段没柱子是本地库没有那段资金记录, 不是零流入, 得说明白
                 if px[0] > max(2, int(n * 0.3)):
-                    ax2.annotate("资金动能自 %s 起有记录" % dates[px[0]],
-                                 xy=(px[0], 0), xytext=(4, -9),
-                                 textcoords="offset points", fontsize=6.5, color=SUB)
+                    ax2.text(0.99, 0.9, "资金动能自 %s 起有记录" % dates[px[0]],
+                             transform=ax2.transAxes, ha="right", va="top",
+                             fontsize=6.8, color=SUB,
+                             bbox=dict(facecolor=PANEL, alpha=0.7, edgecolor="none",
+                                       pad=1.6))
             ax2.axhline(0, color=GRID, lw=0.8)
             ax2.grid(alpha=0.2, ls=":")
             ax2.tick_params(labelsize=7)
