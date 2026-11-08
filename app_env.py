@@ -44,9 +44,12 @@ def bundle_dir():
     return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
 
-# matplotlib 的 font.sans-serif 候选链, 顺序即优先级
+# matplotlib 的 font.sans-serif 候选链, 顺序即优先级。
+# macOS 上把 Hiragino Sans GB 排在 PingFang 前面是有实测依据的: matplotlib 认不动
+# PingFang.ttc 里的 face 名, 真按 PingFang 排第一会静默跳过后一个, 虽然中文照样出,
+# 但首选字体一直没生效。Hiragino 在 macOS 10.5 起就有, 各版本都稳。
 CJK_FONTS = (
-    ["PingFang SC", "Hiragino Sans GB", "Heiti SC", "STHeiti", "Songti SC", "Arial Unicode MS"]
+    ["Hiragino Sans GB", "PingFang SC", "Heiti SC", "STHeiti", "Songti SC", "Arial Unicode MS"]
     if IS_MAC else
     ["Microsoft YaHei", "SimHei", "DengXian", "SimSun"]
 )
