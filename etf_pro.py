@@ -61,12 +61,15 @@ import etf_minute  # noqa: E402
 
 # 主题与品牌: 自用版 / 发布版共用一套逻辑, 外观由 brand 决定
 import brand  # noqa: E402
+import app_env  # noqa: E402
 
 BG = brand.BG; PANEL = brand.PANEL; PANEL2 = brand.PANEL2
 TXT = brand.TXT; SUB = brand.SUB; UP = brand.UP; DOWN = brand.DOWN
 ACCENT = brand.ACCENT; GRID = brand.GRID; WARN = brand.WARN
 
-matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+# 字体名按平台取: macOS 用苹方, Windows 用微软雅黑。写死微软雅黑的话
+# macOS 上 matplotlib 会退回 DejaVu Sans, 中文全变方块。
+matplotlib.rcParams["font.sans-serif"] = app_env.CJK_FONTS
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 DARK_RC = {
@@ -170,7 +173,7 @@ QPushButton:disabled {{ background: {GRID}; color: {SUB}; }}
 QComboBox {{ background: {PANEL2}; color: {TXT}; border: 1px solid {GRID};
     padding: 4px 8px; border-radius: 3px; }}
 QTextEdit {{ background: {PANEL}; border: 1px solid {GRID};
-    font-family: "Microsoft YaHei"; font-size: 13px; padding: 8px; }}
+    font-family: {app_env.CJK_CSS}; font-size: 13px; padding: 8px; }}
 QStatusBar {{ background: {PANEL2}; color: {SUB}; }}
 QToolBar {{ background: {PANEL2}; border-bottom: 1px solid {GRID}; spacing: 8px; }}
 QLabel#title {{ font-size: 15px; font-weight: bold; color: {TXT}; }}
@@ -4080,14 +4083,17 @@ def _app_icon():
     """窗口与任务栏图标。打包后资源在 _internal, 源码运行时在项目目录。
 
     两个构建用不同配色: 发布版墨绿琥珀, 自用版深灰蓝亮蓝。
+    格式优先级按平台走: macOS 对 .ico 支持不稳, 用 png 更保险。
     """
-    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    names = ("icon_a.ico", "icon_self.ico") if brand.PUBLISH else ("icon_self.ico", "icon_a.ico")
-    for name in names:
-        for rel in ("icons/" + name, name):
-            p = root / rel
-            if p.exists():
-                return QIcon(str(p))
+    root = app_env.bundle_dir()
+    main = "icon_a" if brand.PUBLISH else "icon_self"
+    alt = "icon_self" if brand.PUBLISH else "icon_a"
+    for stem in (main, alt):
+        for ext in app_env.ICON_EXTS:
+            for rel in ("icons/%s.%s" % (stem, ext), "%s.%s" % (stem, ext)):
+                p = root / rel
+                if p.exists():
+                    return QIcon(str(p))
     return QIcon()
 
 

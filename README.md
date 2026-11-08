@@ -45,7 +45,19 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-不装 Python 的话，直接下 Releases 里的 Windows 压缩包，解压后运行 `IndexCompass.exe`。首次启动需要联网抓数据。
+不装 Python 的话，直接下 Releases 里对应自己系统的包：
+
+| 系统 | 文件 | 用法 |
+|---|---|---|
+| Windows 10/11 | `IndexCompass-windows.zip` | 解压后双击 `IndexCompass.exe` |
+| macOS Apple 芯片（M1 及以后） | `IndexCompass-macos-arm64.zip` | 解压得到 `IndexCompass.app`，拖进「应用程序」 |
+| macOS Intel（2020 年前机型） | `IndexCompass-macos-x86_64.zip` | 同上 |
+
+首次启动需要联网抓数据。
+
+macOS 包没有做苹果开发者签名（需要付费证书），首次双击会被系统拦下。右键点 `IndexCompass.app` 选「打开」，在弹窗里再点一次「打开」即可，之后双击就正常了。也可以在终端跑一次 `xattr -dr com.apple.quarantine /Applications/IndexCompass.app`。
+
+macOS 的数据放在 `~/Library/Application Support/IndexCompass/`，不在 app 包里面。这样可以随时覆盖安装或删掉 app 而不丢库，卸载时把这个目录一起删掉就干净了。
 
 ## 运行
 
@@ -101,7 +113,7 @@ python etf_desktop.py    # Tkinter 轻量版
 
 ## 常见问题
 
-**打不开或闪退。** 先确认解压完整，不要直接在压缩包里运行 exe。Windows 可能提示来源不明，属正常现象，本项目未做代码签名。
+**打不开或闪退。** 先确认解压完整，不要直接在压缩包里运行 exe。Windows 可能提示来源不明，属正常现象，本项目未做代码签名。macOS 提示「无法验证开发者」也是同一原因，右键选「打开」放行一次就行。
 
 **首次启动卡住。** 在抓全池数据，视网络情况需要几分钟。断网状态下只能看已缓存的库。
 
@@ -121,7 +133,7 @@ python etf_desktop.py    # Tkinter 轻量版
 | 数据不对 / 数字可疑 | 某只 ETF 的数值与公告或行情软件明显不符 | 代码、页签、数据日期、界面显示多少、你认为应该是多少、依据 |
 | 功能建议 | 想要某个功能，或某处用起来别扭 | 使用场景、现在怎么绕过、期望的样子 |
 
-版本号在**窗口标题最右边**，形如 `v1.0.4`，报错弹窗的第一行也带。`refresh.log` 在 exe 同一个目录下，用记事本打开即可。没有这两个信息，只能靠猜是哪一版出的问题，来回问答会拖很久。
+版本号在**窗口标题最右边**，形如 `v1.0.5`，报错弹窗的第一行也带。`refresh.log` 在 Windows 上是 exe 同目录，macOS 上是 `~/Library/Application Support/IndexCompass/`。没有这两个信息，只能靠猜是哪一版出的问题，来回问答会拖很久。
 
 **开放讨论走 Discussions**：[Discussions](https://github.com/Syakukou/ETFindex-compass/discussions)。放「这个指标该怎么解读」「这类 ETF 该不该进池子」「你平时怎么用它」这类没有标准答案的话题，以及自己改出来的用法。有明确报错或数据错误仍然走 Issues，那边能贴文件、能追踪状态。
 
@@ -140,9 +152,9 @@ pip install pyinstaller
 pyinstaller IndexCompass.spec
 ```
 
-产物在 `dist/IndexCompass/`。onedir 模式下 `etf_tracker.db` 与 `etf_list.json` 需要放到 exe 同级目录，程序会自动读取。
+产物在 `dist/IndexCompass/`（macOS 上还会多一层 `IndexCompass.app`）。onedir 模式下 `etf_tracker.db` 与 `etf_list.json` 需要放到 exe 同级目录，程序会自动读取；macOS 上这两样改放 `~/Library/Application Support/IndexCompass/`，程序自己建。
 
-仓库配了 GitHub Actions（`.github/workflows/build.yml`）：推到 `v*` 标签会自动在 Windows 环境打包、压缩并挂到 Release；也可以在 Actions 页面手动触发，只产出 artifact 不发版。
+仓库配了 GitHub Actions（`.github/workflows/build.yml`）：推到 `v*` 标签会自动在 Windows 和 macOS 上打包、压缩并挂到 Release；也可以在 Actions 页面手动触发，只产出 artifact 不发版。PyInstaller 不能交叉编译，所以 macOS 包必须在 macOS 环境出，不能在 Windows 上代劳。
 
 ## 目录结构
 
@@ -158,6 +170,7 @@ etf_index.py      指数、期货、期权数据
 etf_meta.py       名称解析与跨境判断
 etf_desktop.py    Tkinter 轻量版
 brand.py          品牌与主题（自用 / 发布两套外观）
+app_env.py        跨平台环境（数据目录、中文字体、应用标识）
 etf_pub.py        发布版入口
 etf_list.json     ETF 池配置
 ```

@@ -20,8 +20,12 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import sys as _sys
-BASE = (Path(_sys.executable).resolve().parent if getattr(_sys, "frozen", False)
-        else Path(__file__).resolve().parent)
+
+# 数据目录由 app_env 决定: Windows 写 exe 同级, macOS 写 ~/Library/Application Support。
+# macOS 的 .app 内部不可写, 且覆盖安装会连数据一起换掉, 不能沿用 exe 同级。
+import app_env  # noqa: E402
+
+BASE = app_env.data_dir()
 DB = BASE / "etf_tracker.db"
 CONFIG = BASE / "etf_list.json"
 KLINE_DAYS = 480  # 保留约两年日K, 周K/月K 才够画
