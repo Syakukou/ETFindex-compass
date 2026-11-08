@@ -81,6 +81,9 @@ DARK_RC = {
 }
 plt.rcParams.update(DARK_RC)
 
+# 报错提示里要指路, 但 Windows 和 macOS 的日志落地位置不一样, 统一从这里取
+LOG_FILE = Path(etf_app.DB).parent / "flow_debug.log"
+
 # 走势页的周期选项 → 分钟接口的 period 参数
 PERIOD_MIN = {"5分钟": "5", "15分钟": "15", "30分钟": "30", "60分钟": "60"}
 
@@ -2079,8 +2082,8 @@ class ProWindow(QMainWindow):
             self.btn_flow.setText(" 重试 ")
             self.flow_concl.setText(
                 "<span style='color:%s'>这一页要联网取指数/期货/期权行情, 这次没取到。</span>"
-                "　原因: %s　·　点右上「重试」再来一次; 反复失败就看 exe 同级目录的 "
-                "flow_debug.log" % (WARN, err))
+                "　原因: %s　·　点右上「重试」再来一次; 反复失败就看日志 %s"
+                % (WARN, err, LOG_FILE))
             self.flow_note.setText("")
             self._draw_flow_placeholder("取数失败")
             return
@@ -2144,7 +2147,7 @@ class ProWindow(QMainWindow):
         self.flow_meta.setText("取数超过 90 秒没有返回")
         self.flow_concl.setText(
             "<span style='color:%s'>这一页要联网取指数/期货/期权行情, 90 秒没回来。</span>"
-            "　点右上「重试」再来一次; 一直不动就看 exe 同级目录的 flow_debug.log" % WARN)
+            "　点右上「重试」再来一次; 一直不动就看日志 %s" % (WARN, LOG_FILE))
         self._draw_flow_placeholder("取数超时", "网络卡住或被拦截, 点「重试」")
 
     def _draw_flow_placeholder(self, title, sub=""):
